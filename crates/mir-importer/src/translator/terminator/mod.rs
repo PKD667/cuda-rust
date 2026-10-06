@@ -1298,6 +1298,41 @@ fn translate_call(
         return Ok(emit_trap_unreachable_after(ctx, block_ptr, prev_op, loc));
     }
 
+    // `hint::spin_loop` is a hint, and on x86 core spells it as the `pause` instruction: it picks
+    // its body with `cfg_select!` on `target_arch`, and core is precompiled for x86_64, so this is
+    // the branch a device build of a worker reaches. The callee arrives as the LLVM intrinsic's own
+    // name with no `pattern_name`, which is why it is caught here rather than in the dispatch table.
+    // There is no `pause` on the device, and the standard library's rule for a platform that does
+    // not support the hint is that it does nothing at all, so dropping the call is the lowering.
+    if matches!(
+        call_name.as_deref(),
+        Some("llvm.x86.sse2.pause") | Some("core::arch::x86_64::_mm_pause")
+    ) {
+        return helpers::emit_unit_noop_intrinsic(
+            ctx,
+            destination,
+            &target_usize,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+            "core::hint::spin_loop",
+        );
+    }
+
+    // `compare_bytes` is the one intrinsic served by a device function rather than by an
+    // instruction: the collector enqueued `cuda_device`'s loop under this symbol, because
+    // `llvm.memcmp` only promises zero or non-zero and Rust reads the sign. The redirect happens
+    // here, before the refusal below, because that refusal is what an unserved intrinsic gets.
+    let mut call_name = call_name;
+    if matches!(
+        pattern_name.as_deref(),
+        Some("core::intrinsics::compare_bytes") | Some("std::intrinsics::compare_bytes")
+    ) {
+        call_name = Some("cuda_oxide_memcmp".to_string());
+    }
+
     // A call to a rustc intrinsic that no dispatch arm above recognized can
     // never be emitted as a regular function call: rustc resolves intrinsics
     // to `InstanceKind::Intrinsic`, the collector skips those by design, so
@@ -1306,8 +1341,14 @@ fn translate_call(
     // "Symbol ... not found" verifier error on the LLVM dialect module.
     // Fail here instead, with the intrinsic's name and source location, so
     // each gap surfaces as an actionable per-site diagnostic (issue #137).
+    // `compare_bytes` is exempt because a definition does exist for it: the redirect above names
+    // the device loop the collector exported, so the reason this guard gives does not hold.
     if let Some(ref name) = pattern_name
         && (name.starts_with("core::intrinsics::") || name.starts_with("std::intrinsics::"))
+        && !matches!(
+            name.as_str(),
+            "core::intrinsics::compare_bytes" | "std::intrinsics::compare_bytes"
+        )
     {
         return input_err!(
             loc,
@@ -1340,7 +1381,6 @@ fn translate_call(
     // the program's `#[device_allocator]` functions under fixed symbols, so the call goes to
     // those; the no-alloc marker has nothing to do on a device. `handle_alloc_error` diverges
     // and is trapped by the diverging-call arm above.
-    let mut call_name = call_name;
     if let Some(ref name) = pattern_name
         && (name.starts_with("alloc::") || name.starts_with("std::alloc::"))
         && let Some(shim) = name.rsplit("::").next()
@@ -1355,7 +1395,6 @@ fn translate_call(
             call_name = Some(entry.export.to_string());
         }
     }
-
     // Not an intrinsic - emit regular function call
     let raw_name = call_name.unwrap_or_else(|| "unknown_function".to_string());
     let legal_name = legaliser.legalise(&raw_name);

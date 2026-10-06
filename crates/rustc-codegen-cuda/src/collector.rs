@@ -1507,6 +1507,17 @@ impl<'tcx> DeviceCollector<'tcx> {
             return;
         }
 
+        // `compare_bytes` has no device instruction and no usable LLVM intrinsic: `llvm.memcmp`
+        // only promises zero or non-zero, and Rust reads the sign. A loop in `cuda_device` is the
+        // lowering, enqueued here under the fixed symbol the importer calls.
+        if fn_path == "core::intrinsics::compare_bytes"
+            || fn_path == "std::intrinsics::compare_bytes"
+        {
+            if self.serve_device_function("memcmp", "cuda_oxide_memcmp", &callee_ctx) {
+                return;
+            }
+        }
+
         // Skip intrinsics and other special functions, but allow DropGlue
         // instances through so that drop_in_place calls inside drop shim
         // bodies (e.g. for array/slice element drops) are collected.
@@ -2108,16 +2119,26 @@ impl<'tcx> DeviceCollector<'tcx> {
         let Some(entry) = reserved_oxide_symbols::alloc_shim(shim) else {
             return false;
         };
-        let Some(instance) = self.find_device_allocator(entry.device_fn) else {
+        self.serve_device_function(entry.device_fn, entry.export, ctx)
+    }
+
+    /// Enqueues a device function of this backend's own runtime under a fixed export symbol, for a
+    /// construct the importer rewrites by name rather than a call the collector can follow.
+    fn serve_device_function(
+        &mut self,
+        device_fn: &str,
+        export: &str,
+        ctx: &DiscoveryCtx,
+    ) -> bool {
+        let Some(instance) = self.find_device_function(device_fn) else {
             return false;
         };
         let mangled = self.tcx.symbol_name(instance).name.to_string();
         if self.seen.contains(&mangled) {
             return true;
         }
-        let export_name = entry.export.to_string();
         if self.verbose {
-            eprintln!("[collector] Device allocator `{shim}` -> {export_name}");
+            eprintln!("[collector] Device function `{device_fn}` -> {export}");
         }
         self.discovery.insert(
             mangled.clone(),
@@ -2128,11 +2149,11 @@ impl<'tcx> DeviceCollector<'tcx> {
             },
         );
         self.seen.insert(mangled);
-        self.used_export_names.insert(export_name.clone());
+        self.used_export_names.insert(export.to_string());
         self.worklist.push_back(CollectedFunction {
             instance,
             is_kernel: false,
-            export_name,
+            export_name: export.to_string(),
         });
         true
     }
@@ -2142,7 +2163,7 @@ impl<'tcx> DeviceCollector<'tcx> {
     /// Found among a crate's exported non-generic symbols: `#[device]` marks a non-generic function
     /// `#[no_mangle]`, so it is exported by the crate that defines it, and a dependency's MIR is available
     /// under `-Zalways-encode-mir`.
-    fn find_device_allocator(&self, device_fn: &str) -> Option<Instance<'tcx>> {
+    fn find_device_function(&self, device_fn: &str) -> Option<Instance<'tcx>> {
         use rustc_middle::middle::exported_symbols::ExportedSymbol;
         let wanted = format!("{}{device_fn}", reserved_oxide_symbols::DEVICE_PREFIX);
         std::iter::once(LOCAL_CRATE)

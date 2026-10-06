@@ -36,6 +36,7 @@ pub mod float;
 pub mod grid;
 pub mod mma_frag;
 pub mod prmt;
+pub mod mem;
 pub mod ptx;
 pub mod shared;
 pub mod swizzle;

@@ -45,8 +45,18 @@ device allocator. A program registers one with `#[device_allocator] static HEAP:
 `__rust_dealloc` and `__rust_realloc` from the four `#[device]` functions the attribute generates,
 `handle_alloc_error` traps, and `Vec`, `Box` and `vec![]` compile. The attribute is not
 `#[global_allocator]`: that is the allocator of the host program too. Lowering `Vec` needed
-`ptr::write_bytes` (`mir.memset`) and `size_of_val`/`align_of_val` for sized types. Still refused:
-`size_of_val` of an unsized type, and anything reaching `core::fmt` or a `dyn` vtable.
+`ptr::write_bytes` (`mir.memset`) and `size_of_val`/`align_of_val` for sized types. A `&str` or `&[u8]` constant lowers too: the pliron type is a slice, so the constant is
+materialized as a slice of a promoted immutable global whose bytes come from the allocation its
+provenance names, with the length read from the fat pointer. A slice constant whose element is wider
+than a byte is refused by name. `compare_bytes` is served by a loop in `cuda_device::mem`, which
+the collector enqueues where device code calls the intrinsic: `llvm.memcmp` only promises zero or
+non-zero and Rust reads the sign, so an intrinsic is not a lowering for it. `core::hint::spin_loop` lowers to nothing: core selects its body with `cfg_select!` on
+`target_arch` and core is precompiled for x86_64, so the device build reaches
+`core::arch::x86_64::_mm_pause`, whose declaration names `llvm.x86.sse2.pause`. There is no pause
+instruction on the device, and the standard library's own rule for a platform that does not support
+the hint is to do nothing. Still refused:
+`size_of_val` of an unsized type, and anything reaching `core::fmt` or a `dyn` vtable — which
+includes `Result::unwrap` and `Result::expect`, whose panic path takes `&dyn Debug`.
 
 The remaining enum storage fixtures deliberately fail closed. A pointer word
 and a *whole* pointer-sized integer word may share bytes: the shared bytes are

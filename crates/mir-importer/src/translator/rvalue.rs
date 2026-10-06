@@ -2276,6 +2276,16 @@ pub fn translate_operand(
             let const_str = format!("{:?}", constant.const_);
 
             // Handle pointer-to-array constants (byte strings, typed arrays like [f64; 3], etc.)
+            // A `&str` (or `&[u8]`) constant. `str` is an unsized byte sequence, so there is no
+            // array type to promote and no element-wise form to fall back on: the bytes are the
+            // allocation the constant's own provenance names, and the value is a slice of them.
+            if const_ty_ptr
+                .deref(ctx)
+                .is::<dialect_mir::types::MirSliceType>()
+            {
+                return translate_slice_constant(ctx, constant, const_ty_ptr, block_ptr, prev_op, loc);
+            }
+
             if is_ptr_to_array {
                 return translate_ptr_to_array_constant(
                     ctx,
@@ -5474,6 +5484,195 @@ fn translate_ptr_to_array_constant(
         loc,
     );
     Ok((ptr_val, last_op))
+}
+
+/// Materialize a `&str` or `&[u8]` constant as a slice of a promoted immutable global.
+///
+/// The constant's own bytes are the fat pointer: a pointer placeholder followed by the length in
+/// pointee elements. The bytes it points at are in the allocation its provenance names, so this is
+/// the one constant form whose value is not its own byte image. Only 8-bit elements are handled —
+/// every element of a `str` is a byte, and a wider slice would need the element count, which the
+/// fat pointer already gives, but no caller needs one yet, so a wider slice is refused by name
+/// rather than guessed at.
+fn translate_slice_constant(
+    ctx: &mut Context,
+    constant: &mir::ConstOperand,
+    const_ty_ptr: TypeHandle,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
+    use dialect_mir::ops::{MirConstantOp, MirConstructSliceOp};
+    use dialect_mir::types::{MirArrayType, MirPtrType, MirSliceType};
+    use pliron::builtin::attributes::IntegerAttr;
+    use pliron::builtin::types::{IntegerType, Signedness};
+    use pliron::utils::apint::APInt;
+    use rustc_public::mir::alloc::GlobalAlloc;
+    use std::num::NonZeroUsize;
+
+    let element_ty = {
+        let ty_ref = const_ty_ptr.deref(ctx);
+        ty_ref
+            .downcast_ref::<MirSliceType>()
+            .ok_or_else(|| {
+                input_error_noloc!(TranslationErr::unsupported(
+                    "translate_slice_constant: expected a slice type"
+                ))
+            })?
+            .element_ty
+    };
+    let byte_element = element_ty
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .is_some_and(|ty| ty.width() == 8);
+    if !byte_element {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "a slice constant whose element is wider than a byte is not promoted yet".to_string()
+            )
+        );
+    }
+
+    let alloc = match constant.const_.kind() {
+        ConstantKind::Allocated(alloc) => alloc,
+        _ => {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(
+                    "a slice constant that is not an allocation".to_string()
+                )
+            );
+        }
+    };
+    let width = rustc_public::target::MachineInfo::target_pointer_width().bytes();
+    // The length is the fat pointer's second half, so it is read from the constant's own bytes.
+    let length = alloc
+        .read_partial_uint(width..width * 2)
+        .map_err(|e| {
+            input_error_noloc!(TranslationErr::unsupported(format!(
+                "Failed to read a slice constant's length: {e:?}"
+            )))
+        })? as usize;
+    let Some(&(_, provenance)) = alloc.provenance.ptrs.first() else {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "a slice constant with no provenance names no bytes to promote".to_string()
+            )
+        );
+    };
+
+    let (bytes, alignment) = match GlobalAlloc::from(provenance.0) {
+        GlobalAlloc::Memory(target) => (
+            target
+                .raw_bytes()
+                .ok()
+                .unwrap_or_else(|| target.bytes.iter().map(|b| b.unwrap_or(0)).collect()),
+            target.align,
+        ),
+        GlobalAlloc::Static(def) => {
+            let target = def.eval_initializer().map_err(|e| {
+                input_error_noloc!(TranslationErr::unsupported(format!(
+                    "Failed to evaluate a static behind a slice constant: {e:?}"
+                )))
+            })?;
+            (
+                target
+                    .raw_bytes()
+                    .ok()
+                    .unwrap_or_else(|| target.bytes.iter().map(|b| b.unwrap_or(0)).collect()),
+                target.align,
+            )
+        }
+        other => {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "a slice constant whose provenance is not memory: {other:?}"
+                ))
+            );
+        }
+    };
+    if length > bytes.len() {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "a slice constant of {length} bytes in an allocation of {}",
+                bytes.len()
+            ))
+        );
+    }
+
+    let u8_ty = IntegerType::get(ctx, 8, Signedness::Unsigned).into();
+    let array_ty: TypeHandle = MirArrayType::get(ctx, u8_ty, length as u64).into();
+    let global_alloc = emit_promoted_immutable_global(
+        ctx,
+        array_ty,
+        &bytes[..length],
+        alignment,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    );
+    let global_ptr = global_alloc.get_operation().deref(ctx).get_result(0);
+
+    // The slice field is a generic pointer, so the global's address space is cast here.
+    let data_ptr_ty: TypeHandle = MirPtrType::get_generic(ctx, u8_ty, false).into();
+    let (data, last_op) = cast_to_generic_addrspace_if_needed(
+        ctx,
+        global_ptr,
+        data_ptr_ty,
+        block_ptr,
+        Some(global_alloc.get_operation()),
+        loc.clone(),
+    );
+    // The address-space cast keeps the pointee, so the global's `[u8; N]` has to be reinterpreted
+    // as the slice's element before the fat pointer will take it.
+    let (data, last_op) = coerce_slice_data_pointee(
+        ctx,
+        data,
+        element_ty,
+        false,
+        block_ptr,
+        last_op,
+        loc.clone(),
+    );
+
+    let length_ty = IntegerType::get(ctx, width as u32 * 8, Signedness::Unsigned);
+    let length_op = Operation::new(
+        ctx,
+        MirConstantOp::get_concrete_op_info(),
+        vec![length_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    length_op.deref_mut(ctx).set_loc(loc.clone());
+    MirConstantOp::new(length_op).set_attr_value(
+        ctx,
+        IntegerAttr::new(
+            length_ty,
+            APInt::from_u64(length as u64, NonZeroUsize::new(width * 8).unwrap()),
+        ),
+    );
+    match last_op {
+        Some(prev) => length_op.insert_after(ctx, prev),
+        None => length_op.insert_at_front(block_ptr, ctx),
+    }
+    let length_val = length_op.deref(ctx).get_result(0);
+
+    let slice_op = Operation::new(
+        ctx,
+        MirConstructSliceOp::get_concrete_op_info(),
+        vec![const_ty_ptr],
+        vec![data, length_val],
+        vec![],
+        0,
+    );
+    slice_op.deref_mut(ctx).set_loc(loc);
+    slice_op.insert_after(ctx, length_op);
+    Ok((slice_op.deref(ctx).get_result(0), Some(slice_op)))
 }
 
 /// Materialize `bytes` as an immutable device global holding a `value_ty`.

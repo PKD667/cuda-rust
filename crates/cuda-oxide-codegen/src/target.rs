@@ -1594,10 +1594,10 @@ fn arch_satisfies_feature(
             capability >= 75
         }
         DetectedFeatures::DynamicStack => capability >= 52,
-        // Basic kernels are supported on the project's Volta+ floor. The
+        // Patched: Basic kernels now also run on Maxwell (sm_50+), for the GTX 980. The
         // cross-compilation default remains sm_80, but a detected sm_70/sm_75
         // GPU is a valid and more useful target for `cargo oxide run`.
-        DetectedFeatures::Basic => major >= 7,
+        DetectedFeatures::Basic => major >= 5,
         // `iter` only yields the single-bit constants above.
         _ => false,
     }
@@ -1663,7 +1663,23 @@ fn is_known_blackwell_capability(capability: u32) -> bool {
 fn is_known_cuda_target(capability: u32, suffix: Option<char>) -> bool {
     let known_capability = matches!(
         capability,
-        70 | 72 | 75 | 80 | 86 | 87 | 88 | 89 | 90 | 100 | 101 | 103 | 110 | 120 | 121
+        50 | 52
+            | 53
+            | 70
+            | 72
+            | 75
+            | 80
+            | 86
+            | 87
+            | 88
+            | 89
+            | 90
+            | 100
+            | 101
+            | 103
+            | 110
+            | 120
+            | 121
     );
     known_capability
         && match suffix {
@@ -1798,6 +1814,13 @@ fn target_minimum_ptx_isa(capability: u32, suffix: Option<char>) -> Option<u32> 
     match (capability, suffix) {
         (100 | 101 | 120, Some('f')) => Some(88),
         (capability, _) => match capability {
+            // Maxwell (GTX 980) targets carry the same PTX-ISA floors as the
+            // older arch entries below; without them `required_ptx_feature`
+            // bails and a `stacksave`/`stackrestore` module never raises to
+            // `+ptx73`, which LLVM NVPTX requires for those intrinsics.
+            50 => Some(40),
+            52 => Some(60),
+            53 => Some(63),
             70 => Some(60),
             72 => Some(61),
             75 => Some(63),
@@ -2266,7 +2289,7 @@ mod tests {
             ptx_isa_requirement_for_floor(74, "test", "test").unwrap(),
             PtxIsaRequirement::Ptx78
         );
-        for target in ["sm_70", "sm_80", "sm_86"] {
+        for target in ["sm_52", "sm_70", "sm_80", "sm_86"] {
             assert_eq!(
                 required_ptx_feature(target, PtxIsaRequirement::Ptx73),
                 Some("+ptx73"),

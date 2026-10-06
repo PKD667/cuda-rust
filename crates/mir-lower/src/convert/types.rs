@@ -849,84 +849,261 @@ fn collect_llvm_pointer_storage(
     (!llvm_type_contains_pointer(ctx, ty)).then_some(())
 }
 
-/// Analyze how a slotless incoming pointer-bearing field overlaps the enum's
-/// already-selected storage, and report how to back every one of its pointers
-/// with a real `ptr` slot.
+/// What [`plan_pointer_overlap`] decided for one incoming field's collision set.
+#[derive(Default)]
+struct PointerOverlapPlan {
+    /// Claims to retype as a `ptr` in the stored address space. The field that
+    /// owns each claim keeps its slot; its integer value crosses the
+    /// pointer/integer boundary with `inttoptr`/`ptrtoint` (see
+    /// [`coerce_enum_payload_value`](super::enum_payload_storage::coerce_enum_payload_value)),
+    /// so the pointer variant's bytes are never reconstructed from integer
+    /// memory and the integer variant's value is bit-exact.
+    promote: Vec<(usize, TypeHandle)>,
+    /// Existing `ptr` claim an incoming scalar-integer field shares. The field
+    /// keeps its own slot index, but the slot's physical type is the pointer, so
+    /// construction/extraction convert through `inttoptr`/`ptrtoint` instead of
+    /// a byte store that would overwrite pointer bytes with an integer.
+    share: Option<usize>,
+    /// Fresh `ptr` claims for incoming pointer leaves on otherwise-unclaimed
+    /// bytes, exactly as before this overlay.
+    extra: Vec<LlvmPointerStorage>,
+    /// Existing pointer-free, byte-faithful claims an incoming pointer leaf
+    /// lands inside. Each is re-laid as filler around a new `ptr` slot and its
+    /// owning field becomes slotless, so the aggregate round-trips through
+    /// memory while the pointer leaf keeps a real `ptr` slot. This is the
+    /// `Result<Route, Failure>` shape: the `Failure` name pointer sits inside
+    /// the `Route` integer words.
+    split: Vec<(usize, LlvmPointerStorage)>,
+    /// Pointer-word byte ranges a pointer-free incoming field does not cover.
+    /// The field's variant construction zeroes them so the pointer slot is
+    /// fully defined; otherwise a later copy of the enum would store `undef`
+    /// over the whole pointer word and lose the field's bytes with it.
+    partial_ptr_fills: Vec<(u64, u64)>,
+}
+
+/// Analyze how an incoming field overlaps the enum's already-selected storage,
+/// and report a provenance-preserving way to represent the overlap.
 ///
-/// Returns `Some(extra)` when the field is representable without erasing any
-/// pointer's provenance: every pointer leaf that coincides with an existing
-/// claim reuses that claim, and each remaining ("extra") pointer leaf lands on
+/// The historical answer was `Some(extra)`: every pointer leaf that coincides
+/// with an existing claim reuses it, and each remaining pointer leaf lands on
 /// bytes no other claim covers, so it can be backed by its own fresh `ptr`
-/// slot. `extra` lists exactly those leaves for the caller to add as claims.
-/// An empty `extra` is the exact-match case (e.g. `Option<(usize, &T)>`, whose
-/// single pointer already coincides with the niche carrier); a non-empty
-/// `extra` is the multi-pointer payload case (e.g. `Option<(&mut [T],
-/// &mut [T])>` from `split_at_mut_checked`, whose second slice pointer needs a
-/// slot of its own beside the carrier).
+/// slot. That already covers `Option<(usize, &T)>` (empty `extra`; the pointer
+/// coincides with the niche carrier) and `Option<(&mut [T], &mut [T])>` (one
+/// fresh slot per extra slice pointer).
 ///
-/// Returns `None` when the field cannot be represented without punning a
-/// pointer against non-pointer bits: an existing pointer slot the incoming
-/// field does not also carry at the same offset/size/address space, or an extra
-/// pointer leaf that would overlap an existing (necessarily non-pointer) claim.
-/// That genuine pointer/integer union stays fail-closed — there is no single
-/// LLVM slot type that is both provenance-carrying and integer-exact.
-fn analyze_pointer_overlap(
+/// The overlay extends it to the shapes every `Result` in the NV backend
+/// hits. A pointer word and a whole pointer-sized integer word may share the
+/// same bytes: the shared bytes are stored as a `ptr`, and whichever side is
+/// integer crosses the boundary with `inttoptr`/`ptrtoint`.
+///
+/// It also handles aggregates on either side, because a `Result`'s payload is
+/// usually a whole struct:
+///
+/// * A pointer leaf may be backed by splitting a pointer-free, byte-faithful
+///   claim it sits in or reaches past; the claim's owner becomes slotless and
+///   round-trips through memory while the pointer keeps a real `ptr` slot
+///   (`Result<Route, Failure>`, `Result<Fabric, BackendFault>`).
+/// * A pointer-free field may round-trip through memory over foreign pointer
+///   claims it covers or reaches past; the pointer bytes it does not cover
+///   are zeroed so the shared word is never `undef` when the field is later
+///   copied (`Result<Launched, BackendFault>`).
+///
+/// A shape stays fail-closed when the bits cannot be separated and both sides
+/// kept: an integer strictly inside a pointer word (`.PointerOrBits` with a
+/// `u32`), a claim that already holds a pointer and is only partly covered, a
+/// discriminant carrier, or an address-space mismatch.
+///
+/// Returns `None` for any overlap that cannot be proven to preserve both
+/// provenance and the stored integer bits.
+fn plan_pointer_overlap(
     ctx: &Context,
     incoming_offset: u64,
     incoming_size: u64,
     incoming_ty: TypeHandle,
-    colliding_claims: &[&(u64, u64, TypeHandle)],
-) -> Option<Vec<LlvmPointerStorage>> {
+    claims: &[(u64, u64, TypeHandle)],
+    colliding: &[usize],
+    carrier_claim: Option<usize>,
+) -> Option<PointerOverlapPlan> {
     let incoming_end = incoming_offset.checked_add(incoming_size)?;
 
     let mut incoming = Vec::new();
     collect_llvm_pointer_storage(ctx, incoming_ty, incoming_offset, &mut incoming)?;
 
-    let mut existing = Vec::new();
-    for &&(offset, _size, claim_ty) in colliding_claims {
+    // Existing pointer leaves, each tagged with the claim that owns it, that
+    // overlap the incoming field's bytes.
+    let mut existing: Vec<(usize, LlvmPointerStorage)> = Vec::new();
+    for &ci in colliding {
+        let (claim_offset, _claim_size, claim_ty) = claims[ci];
         let mut regions = Vec::new();
-        collect_llvm_pointer_storage(ctx, claim_ty, offset, &mut regions)?;
-        existing.extend(regions.into_iter().filter(|region| {
+        collect_llvm_pointer_storage(ctx, claim_ty, claim_offset, &mut regions)?;
+        for region in regions {
             let Some(region_end) = region.offset.checked_add(region.size) else {
-                return true;
+                return None;
             };
-            region.offset < incoming_end && incoming_offset < region_end
-        }));
-    }
-
-    // Every existing pointer leaf overlapping this field must be one the field
-    // also carries at the same offset/size/address space; otherwise a pointer
-    // slot would be backed by non-matching bytes (an address-space mismatch, or
-    // a pointer claim where the field has integer bits).
-    for leaf in &existing {
-        if !incoming.contains(leaf) {
-            return None;
+            if region.offset < incoming_end && incoming_offset < region_end {
+                existing.push((ci, region));
+            }
         }
     }
 
-    // Each incoming pointer leaf that does not reuse an existing claim needs its
-    // own slot, and may only get one if it lands on otherwise-unclaimed bytes. A
-    // leaf overlapping a claim it did not match is a pointer/non-pointer pun and
-    // stays fail-closed.
-    let mut extra = Vec::new();
-    for leaf in &incoming {
-        if existing.contains(leaf) {
+    let mut plan = PointerOverlapPlan::default();
+
+    // A scalar 64-bit integer field that exactly covers one existing `ptr`
+    // claim shares that slot: variants do not overlap in time, so the slot is a
+    // pointer when the pointer variant is alive and an `inttoptr` of the integer
+    // when the integer variant is alive. Restricted to the whole-claim match so
+    // no pointer byte is ever left holding an integer's tail. The carrier is
+    // excluded because it is the discriminant: an integer written through it
+    // would corrupt the variant selection.
+    let incoming_scalar_64 = incoming_ty
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .is_some_and(|integer| integer.width() == 64);
+    if incoming.is_empty() && incoming_scalar_64 && colliding.len() == 1 {
+        let ci = colliding[0];
+        if Some(ci) != carrier_claim {
+            let (claim_offset, claim_size, claim_ty) = claims[ci];
+            if claim_offset == incoming_offset
+                && claim_size == incoming_size
+                && claim_ty.deref(ctx).is::<llvm_types::PointerType>()
+            {
+                plan.share = Some(ci);
+                return Some(plan);
+            }
+        }
+    }
+
+    // A pointer-free incoming field over pointer claims: it carries no pointer
+    // of its own, so it can round-trip through memory at its offset. The
+    // discriminant carrier is off limits, and so is a pointer word the field
+    // sits strictly inside of (a `u32` under the low half of a pointer): with
+    // no field byte outside the pointer there is nothing to anchor the
+    // reconstruction. A field that reaches past the pointer word is the
+    // `Result<Launched, BackendFault>` `Err` payload at byte 4 over the `Ok`
+    // arena at byte 8; its own bytes cover part of the word, and the uncovered
+    // tail is zeroed so the word is never `undef`.
+    if incoming.is_empty() {
+        if colliding.iter().any(|&ci| Some(ci) == carrier_claim) {
+            return None;
+        }
+        for (ci, leaf) in &existing {
+            if Some(*ci) == carrier_claim {
+                return None;
+            }
+            let Some(leaf_end) = leaf.offset.checked_add(leaf.size) else {
+                return None;
+            };
+            let contained = incoming_offset <= leaf.offset && leaf_end <= incoming_end;
+            let extends_outside = incoming_offset < leaf.offset || leaf_end < incoming_end;
+            if !contained && !extends_outside {
+                return None;
+            }
+            if leaf.offset < incoming_offset {
+                plan.partial_ptr_fills
+                    .push((leaf.offset, incoming_offset - leaf.offset));
+            }
+            if incoming_end < leaf_end {
+                plan.partial_ptr_fills
+                    .push((incoming_end, leaf_end - incoming_end));
+            }
+        }
+        return Some(plan);
+    }
+
+    // Every existing pointer leaf overlapping this field must either be one the
+    // field also carries at the same offset/size/address space, be the
+    // discriminant carrier (which no payload may overwrite), or be wholly
+    // contained in the incoming field's bytes. A foreign pointer fully covered
+    // by a slotless incoming field is dead when this variant is live: the
+    // field's own store overwrites it. A pointer only *partly* covered would
+    // leave a half-overwritten pointer word behind, so it stays fail-closed.
+    for (ci, leaf) in &existing {
+        if incoming.contains(leaf) {
             continue;
         }
-        let leaf_end = leaf.offset.checked_add(leaf.size)?;
-        let overlaps_claim = colliding_claims.iter().any(|&&(o, s, _)| {
-            let Some(claim_end) = o.checked_add(s) else {
-                return true;
-            };
-            o < leaf_end && leaf.offset < claim_end
-        });
-        if overlaps_claim {
+        if Some(*ci) == carrier_claim {
             return None;
         }
-        extra.push(*leaf);
+        let Some(leaf_end) = leaf.offset.checked_add(leaf.size) else {
+            return None;
+        };
+        if leaf.offset < incoming_offset || incoming_end < leaf_end {
+            return None;
+        }
     }
 
-    Some(extra)
+    // Each incoming pointer leaf that does not reuse an existing claim needs a
+    // real slot. It may either promote a whole scalar-integer claim of the same
+    // extent and address-space width to a `ptr`, or land on otherwise-unclaimed
+    // bytes and get a fresh `ptr` claim. Anything else is a pun we cannot
+    // prove.
+    for leaf in &incoming {
+        if existing.iter().any(|(_, e)| e == leaf) {
+            continue;
+        }
+        let Some(leaf_end) = leaf.offset.checked_add(leaf.size) else {
+            return None;
+        };
+        let overlapping: Vec<usize> = colliding
+            .iter()
+            .copied()
+            .filter(|&ci| {
+                let (o, s, _) = claims[ci];
+                let Some(claim_end) = o.checked_add(s) else {
+                    return true;
+                };
+                o < leaf_end && leaf.offset < claim_end
+            })
+            .collect();
+        if overlapping.is_empty() {
+            plan.extra.push(*leaf);
+            continue;
+        }
+        if overlapping.len() != 1 {
+            return None;
+        }
+        let ci = overlapping[0];
+        if Some(ci) == carrier_claim {
+            return None;
+        }
+        let (claim_offset, claim_size, claim_ty) = claims[ci];
+        let claim_is_scalar_64 = claim_ty
+            .deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .is_some_and(|integer| integer.width() == 64);
+        if claim_offset == leaf.offset && claim_size == leaf.size && claim_is_scalar_64 {
+            let ptr_ty: TypeHandle = llvm_types::PointerType::get(ctx, leaf.address_space).into();
+            plan.promote.push((ci, ptr_ty));
+            continue;
+        }
+        // A pointer leaf may instead land in a pointer-free, byte-faithful
+        // claim (the `Result<Route, Failure>` words, and the reverse
+        // `Result<Fabric, BackendFault>` direction). The claim's owner becomes
+        // slotless and round-trips through memory; the leaf's bytes become a
+        // real `ptr` slot and the claimant's remaining bytes are re-laid as
+        // filler by the caller. A claim that already holds a pointer, or that
+        // is not byte-faithful, cannot be split this way.
+        let claim_end = claim_offset.checked_add(claim_size)?;
+        // A claim strictly inside the pointer word (a `u32` under the low half)
+        // has no owner byte outside the pointer to anchor the split and stays
+        // fail-closed. A claim that contains the leaf or reaches outside it can
+        // be re-laid around the leaf.
+        let claim_contains_leaf = claim_offset <= leaf.offset && leaf_end <= claim_end;
+        let claim_extends_outside = claim_offset < leaf.offset || leaf_end < claim_end;
+        let splittable = !llvm_type_contains_pointer(ctx, claim_ty)
+            && llvm_type_is_byte_faithful(ctx, claim_ty)
+            && (claim_contains_leaf || claim_extends_outside);
+        if splittable {
+            if plan.split.iter().any(|(existing, _)| *existing == ci) {
+                return None;
+            }
+            plan.split.push((ci, *leaf));
+            continue;
+        }
+        return None;
+    }
+
+    Some(plan)
 }
 
 pub(crate) fn llvm_type_contains_pointer_in_address_space(
@@ -1302,6 +1479,10 @@ pub(crate) struct EnumSlotMap {
     pub field_offsets: Vec<u64>,
     /// Converted LLVM type of each payload field.
     pub field_llvm_types: Vec<TypeHandle>,
+    /// For each payload field, pointer-word byte ranges inside a shared slot
+    /// that the field's slotless store does not cover. Constructing that
+    /// field's variant zeroes them so the pointer word stays fully defined.
+    pub field_partial_ptr_fills: Vec<Vec<(u64, u64)>>,
 }
 
 /// Build the LLVM struct for an enum, placing everything at the byte
@@ -1486,6 +1667,8 @@ pub(crate) fn build_enum_slot_map(
     };
 
     let mut claim_of_field: Vec<Option<usize>> = vec![None; field_llvm_types.len()];
+    let mut field_partial_ptr_fills: Vec<Vec<(u64, u64)>> =
+        vec![Vec::new(); field_llvm_types.len()];
     let mut field_is_inhabited = Vec::with_capacity(field_llvm_types.len());
     for (variant, count) in variant_field_counts.iter().enumerate() {
         field_is_inhabited.extend(std::iter::repeat_n(
@@ -1637,45 +1820,74 @@ pub(crate) fn build_enum_slot_map(
         }
         // The bytes are taken by a different type. Pointer-free values can
         // use the memory fallback below. Pointer-bearing values may do so only
-        // when a physical-layout walk proves that every pointer leaf exactly
-        // matches an existing pointer slot. This is the common
-        // `Option<(usize, &T)>` shape: the niche carrier is the tuple's pointer
-        // field. A pointer/non-pointer overlap, address-space mismatch, or
-        // additional pointer without a pointer slot still fails closed.
-        let colliding_claims = claims
+        // when a physical-layout walk proves every pointer leaf keeps a real
+        // `ptr` slot: an exact match with an existing pointer claim, a fresh
+        // slot on unclaimed bytes, or a whole-word overlay with a scalar
+        // pointer-sized integer claim (promoted to `ptr` here). This covers the
+        // `Option<(usize, &T)>` shape, the two-pointer `split_at_mut_checked`
+        // payload, and the pointer/integer `Result` words. A partial overlap, an
+        // aggregate on either side, or an address-space mismatch still fails
+        // closed.
+        let colliding_claims: Vec<usize> = claims
             .iter()
-            .filter(|&&(o, s, _)| offset < o + s && o < offset + size)
-            .collect::<Vec<_>>();
+            .enumerate()
+            .filter(|&(_, &(o, s, _))| offset < o + s && o < offset + size)
+            .map(|(ci, _)| ci)
+            .collect();
         if !colliding_claims.is_empty() {
             let has_pointer_overlap = llvm_type_contains_pointer(ctx, storage_ty)
                 || colliding_claims
                     .iter()
-                    .any(|&&(_, _, claim_ty)| llvm_type_contains_pointer(ctx, claim_ty));
+                    .any(|&ci| llvm_type_contains_pointer(ctx, claims[ci].2));
             // Pointer-bearing overlaps must back every pointer leaf with a real
-            // `ptr` slot so the memory round-trip preserves provenance. The
-            // niche carrier backs the leaf that coincides with it; any further
-            // pointer leaf (the extra slice pointer in `split_at_mut_checked`'s
+            // `ptr` slot so the memory round-trip preserves provenance. A
+            // pointer leaf coinciding with the niche carrier (or another `ptr`
+            // claim) reuses it; a whole-word pointer/integer overlay promotes
+            // the integer claim to `ptr` and converts its value through
+            // `inttoptr`/`ptrtoint`; any further pointer leaf
+            // (the extra slice pointer in `split_at_mut_checked`'s
             // `Option<(&mut [T], &mut [T])>`) gets its own fresh `ptr` slot.
-            // `None` means a pointer punned against non-pointer bits, which
-            // stays fail-closed.
-            let extra_pointer_claims = if has_pointer_overlap {
-                match analyze_pointer_overlap(ctx, offset, size, storage_ty, &colliding_claims) {
-                    Some(extra) => extra,
+            // `None` means a pun we cannot prove sound, which stays
+            // fail-closed.
+            let plan = if has_pointer_overlap {
+                match plan_pointer_overlap(
+                    ctx,
+                    offset,
+                    size,
+                    storage_ty,
+                    &claims,
+                    &colliding_claims,
+                    carrier_claim,
+                ) {
+                    Some(plan) => plan,
                     None => {
+                        let claims_display = colliding_claims
+                            .iter()
+                            .map(|&ci| {
+                                let (o, s, t) = claims[ci];
+                                format!("[byte {o}..{} {}]", o + s, t.deref(ctx).disp(ctx))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         return Err(anyhow::anyhow!(
-                            "enum slot map: `{}` has overlapping pointer and non-identical storage at byte {}; refusing to erase LLVM pointer provenance",
+                            "enum slot map: `{}` field {} (bytes {}..{} {}) overlaps {} with non-identical storage at byte {}; refusing to erase LLVM pointer provenance",
                             name,
+                            flat,
+                            offset,
+                            offset + size,
+                            storage_ty.deref(ctx).disp(ctx),
+                            claims_display,
                             offset
                         ));
                     }
                 }
             } else {
-                Vec::new()
+                PointerOverlapPlan::default()
             };
             let incoming_is_byte_faithful = llvm_type_is_byte_faithful(ctx, storage_ty);
             let claims_are_byte_faithful = colliding_claims
                 .iter()
-                .all(|&&(_, _, claim_ty)| llvm_type_is_byte_faithful(ctx, claim_ty));
+                .all(|&ci| llvm_type_is_byte_faithful(ctx, claims[ci].2));
             if !incoming_is_byte_faithful || !claims_are_byte_faithful {
                 return Err(anyhow::anyhow!(
                     "enum slot map: `{}` field {} overlaps non-identical storage but its lowered type is not byte-faithful (for example, it may contain implicit padding); refusing a type-punned store",
@@ -1683,13 +1895,97 @@ pub(crate) fn build_enum_slot_map(
                     flat
                 ));
             }
+            // Retype the promoted claims before the extra claims are pushed so
+            // every later field walk sees the pointer storage. The field that
+            // already owns a promoted claim keeps its slot index and converts
+            // its integer value at construction/extraction.
+            for (ci, ptr_ty) in &plan.promote {
+                claims[*ci].2 = *ptr_ty;
+            }
+            // A pointer leaf that lands inside a pointer-free, byte-faithful
+            // claim splits it: the claim's owning field becomes slotless and
+            // round-trips through memory, its bytes around the leaf are re-laid
+            // as filler, and the leaf's bytes become a real `ptr` slot. This is
+            // the `Result<Route, Failure>` shape (the name pointer inside the
+            // route's integer words). The owner's slot is cleared because its
+            // claim's type no longer describes the bytes.
+            for (ci, leaf) in &plan.split {
+                let (claim_offset, claim_size, _claim_ty) = claims[*ci];
+                let claim_end = claim_offset + claim_size;
+                let leaf_end = leaf.offset + leaf.size;
+                // The owner field becomes slotless. When it is constructed its
+                // own store covers its bytes inside the pointer word; the rest
+                // of the word is recorded here to be zeroed so it is never
+                // `undef`.
+                for (owner, slot) in claim_of_field.iter_mut().enumerate() {
+                    if *slot == Some(*ci) {
+                        *slot = None;
+                        let mut fills = Vec::new();
+                        if leaf.offset < claim_offset {
+                            fills.push((leaf.offset, claim_offset - leaf.offset));
+                        }
+                        if claim_end < leaf_end {
+                            fills.push((claim_end, leaf_end - claim_end));
+                        }
+                        if !fills.is_empty() {
+                            field_partial_ptr_fills[owner] = fills;
+                        }
+                    }
+                }
+                let ptr_ty: TypeHandle =
+                    llvm_types::PointerType::get(ctx, leaf.address_space).into();
+                // The claim bytes before and after the leaf stay unclaimed
+                // filler; the leaf's bytes become the pointer slot.
+                let prefix_end = leaf.offset.min(claim_end);
+                let prefix_len = prefix_end.saturating_sub(claim_offset);
+                let suffix_start = leaf_end.max(claim_offset);
+                let suffix_len = claim_end.saturating_sub(suffix_start);
+                if prefix_len > 0 {
+                    claims[*ci] = (
+                        claim_offset,
+                        prefix_len,
+                        make_enum_filler_type(ctx, claim_offset, prefix_len, abi_align),
+                    );
+                    claims.push((leaf.offset, leaf.size, ptr_ty));
+                    if suffix_len > 0 {
+                        claims.push((
+                            suffix_start,
+                            suffix_len,
+                            make_enum_filler_type(ctx, suffix_start, suffix_len, abi_align),
+                        ));
+                    }
+                } else if suffix_len > 0 {
+                    claims[*ci] = (
+                        suffix_start,
+                        suffix_len,
+                        make_enum_filler_type(ctx, suffix_start, suffix_len, abi_align),
+                    );
+                    claims.push((leaf.offset, leaf.size, ptr_ty));
+                } else {
+                    claims[*ci] = (leaf.offset, leaf.size, ptr_ty);
+                }
+            }
             // Back each extra pointer leaf with its own `ptr` slot (the field
             // itself stays slotless and round-trips through memory). Added after
-            // the byte-faithfulness gate so `colliding_claims`'s borrow of
-            // `claims` has ended before we push.
-            for leaf in extra_pointer_claims {
+            // the byte-faithfulness gate so the immutable borrow of `claims` has
+            // ended before we push.
+            for leaf in &plan.extra {
                 let ptr_ty = llvm_types::PointerType::get(ctx, leaf.address_space).into();
                 claims.push((leaf.offset, leaf.size, ptr_ty));
+            }
+            // A scalar integer that shares an existing pointer claim takes that
+            // slot so its value converts through `inttoptr`/`ptrtoint` rather
+            // than a byte store that would overwrite pointer bytes.
+            if let Some(ci) = plan.share {
+                if field_gets_slot {
+                    claim_of_field[flat] = Some(ci);
+                }
+            }
+            // A pointer-free field that only partly covers a foreign pointer
+            // word records the uncovered tail so its variant construction can
+            // define it.
+            if !plan.partial_ptr_fills.is_empty() {
+                field_partial_ptr_fills[flat] = plan.partial_ptr_fills.clone();
             }
             continue;
         }
@@ -1773,6 +2069,7 @@ pub(crate) fn build_enum_slot_map(
         field_slots,
         field_offsets: all_field_offsets,
         field_llvm_types,
+        field_partial_ptr_fills,
     })
 }
 
@@ -2659,58 +2956,236 @@ mod tests {
         assert!(map.field_slots[0].is_some());
     }
 
+    /// Builds `#[repr(C)] enum PointerOrBits { Bits(u64), Pointer(*const u8) }`
+    /// with a distinct i32 tag, both payloads occupying bytes 8..16. Returns
+    /// the enum type and the flattened index of the pointer and bits fields in
+    /// declaration order (`pointer_first == true` puts `Pointer` at flat 0).
+    fn pointer_or_bits_enum(
+        ctx: &mut Context,
+        pointer_first: bool,
+        integer: TypeHandle,
+        integer_size: u64,
+    ) -> (TypeHandle, usize, usize) {
+        let discr = mir_uint(ctx, 32);
+        let u8_ty = mir_uint(ctx, 8);
+        let pointer: TypeHandle = MirPtrType::get_generic(ctx, u8_ty, false).into();
+        let (first_name, first_ty, first_size, second_name, second_ty, second_size) =
+            if pointer_first {
+                ("Ptr", pointer, 8, "Bits", integer, integer_size)
+            } else {
+                ("Bits", integer, integer_size, "Ptr", pointer, 8)
+            };
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            ctx,
+            "PointerOrBits".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout(
+                    first_name.into(),
+                    vec![first_ty],
+                    vec![8],
+                    vec![first_size],
+                ),
+                EnumVariant::new_with_layout(
+                    second_name.into(),
+                    vec![second_ty],
+                    vec![8],
+                    vec![second_size],
+                ),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 16,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Direct,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+        let (bits_flat, ptr_flat) = if pointer_first { (1, 0) } else { (0, 1) };
+        (enum_ty, bits_flat, ptr_flat)
+    }
+
+    /// `PointerOrBits` is the overlay the NV `Result<_, Failure>` shapes need:
+    /// a pointer word and a whole pointer-sized integer word share bytes, one
+    /// alive at a time. The shared bytes are stored as a real `ptr` (so the
+    /// pointer variant's provenance survives) and the integer side converts
+    /// through `inttoptr`/`ptrtoint` (so all 64 bits round-trip). The result
+    /// must be independent of source-variant order.
     #[test]
-    fn enum_slot_map_rejects_pointer_nonpointer_overlap_in_either_variant_order() {
+    fn enum_slot_map_overlays_pointer_and_pointer_sized_integer() {
         for pointer_first in [false, true] {
             let mut ctx = make_ctx();
-            let discr = mir_uint(&mut ctx, 32);
-            let u8_ty = mir_uint(&mut ctx, 8);
             let u64_ty = mir_uint(&mut ctx, 64);
-            let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
-            let (first_name, first_ty, second_name, second_ty) = if pointer_first {
-                ("Ptr", pointer, "Bits", u64_ty)
-            } else {
-                ("Bits", u64_ty, "Ptr", pointer)
-            };
-            let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
-                &mut ctx,
-                "PointerOrBits".into(),
-                discr,
-                vec![0, 1],
-                vec![
-                    EnumVariant::new_with_layout(
-                        first_name.into(),
-                        vec![first_ty],
-                        vec![8],
-                        vec![8],
-                    ),
-                    EnumVariant::new_with_layout(
-                        second_name.into(),
-                        vec![second_ty],
-                        vec![8],
-                        vec![8],
-                    ),
-                ],
-                EnumEncoding {
-                    tag_offset: 0,
-                    total_size: 16,
-                    abi_align: 8,
-                    layout_kind: EnumLayoutKind::Direct,
-                    carrier_kind: EnumCarrierKind::Integer,
-                    carrier_width: 32,
-                    variant_inhabited: vec![1, 1],
-                    ..EnumEncoding::default()
-                },
-            )
-            .into();
+            let (enum_ty, bits_flat, ptr_flat) =
+                pointer_or_bits_enum(&mut ctx, pointer_first, u64_ty, 8);
+            let map = build_enum_slot_map(&mut ctx, enum_ty)
+                .expect("a pointer word and a u64 word sharing the same bytes are representable");
+            assert_eq!(
+                llvm_type_size_align(&ctx, map.llvm_struct_ty),
+                Some((16, 8)),
+                "pointer_first={pointer_first}"
+            );
+            let fields = struct_fields(&ctx, map.llvm_struct_ty);
+            let ptr_index = fields
+                .iter()
+                .position(|field| field.deref(&ctx).is::<llvm_types::PointerType>())
+                .expect("the overlaid word must be a real pointer slot");
+            let ptr_index = ptr_index as u32;
+            // The integer side is always backed by the pointer slot. When the
+            // pointer variant is walked second its field is slotless and reads
+            // the pointer back through memory; when walked first it shares the
+            // slot directly. Either way no integer byte store can reach that
+            // word.
+            assert_eq!(
+                map.field_slots[bits_flat],
+                Some(ptr_index),
+                "pointer_first={pointer_first}: the integer variant must share the pointer slot"
+            );
+            let expected_ptr_slot = if pointer_first { Some(ptr_index) } else { None };
+            assert_eq!(
+                map.field_slots[ptr_flat], expected_ptr_slot,
+                "pointer_first={pointer_first}: the pointer variant owns the slot only when it is placed first"
+            );
+        }
+    }
+
+    /// The trame `Result<Route, Failure>` shape: the `Ok` payload has a `usize`
+    /// at byte 8 and a `u32` at byte 16; the `Err` payload is a fat pointer
+    /// `{ptr, usize}` at byte 8, so its pointer word overlays the `Ok` `usize`
+    /// and its length word overlays the `Ok` `u32`. The pointer word must be a
+    /// `ptr` slot; the fat pointer itself stays slotless and round-trips through
+    /// memory (provenance intact, because its pointer word is that slot).
+    #[test]
+    fn enum_slot_map_overlays_aggregate_pointer_over_integer_words() {
+        let mut ctx = make_ctx();
+        let discr = mir_uint(&mut ctx, 32);
+        let u8_ty = mir_uint(&mut ctx, 8);
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let usize_ty = mir_uint(&mut ctx, 64);
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let fat_pointer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "FatPointer".into(),
+            vec!["data".into(), "len".into()],
+            vec![pointer, usize_ty],
+            vec![0, 1],
+            vec![0, 8],
+            16,
+            8,
+        )
+        .into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "RouteOrFailure".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                // `Ok`: words @8, ranks @16, both plain integers.
+                EnumVariant::new_with_layout(
+                    "Ok".into(),
+                    vec![usize_ty, u32_ty],
+                    vec![8, 16],
+                    vec![8, 4],
+                ),
+                // `Err`: one fat pointer at byte 8.
+                EnumVariant::new_with_layout("Err".into(), vec![fat_pointer], vec![8], vec![16]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 24,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Direct,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        let map = build_enum_slot_map(&mut ctx, enum_ty)
+            .expect("the fat pointer's data word overlays a usize and must be promoted");
+        assert_eq!(
+            llvm_type_size_align(&ctx, map.llvm_struct_ty),
+            Some((24, 8))
+        );
+        assert!(
+            struct_fields(&ctx, map.llvm_struct_ty)
+                .iter()
+                .any(|field| field.deref(&ctx).is::<llvm_types::PointerType>()),
+            "the overlaid data word must be a real pointer slot"
+        );
+        // The integer owner keeps its slot; the fat pointer stays slotless.
+        assert!(
+            map.field_slots[0].is_some(),
+            "the overlaid usize owner must keep a slot"
+        );
+        assert_eq!(map.field_slots[2], None);
+    }
+
+    /// Falsifier: one byte of the pointer word inside a 32-bit integer claim
+    /// cannot be overlaid. Only an exact whole-word match preserves both
+    /// provenance and all 64 integer bits.
+    #[test]
+    fn enum_slot_map_rejects_partial_pointer_integer_overlap() {
+        for pointer_first in [false, true] {
+            let mut ctx = make_ctx();
+            let u32_ty = mir_uint(&mut ctx, 32);
+            let (enum_ty, _, _) = pointer_or_bits_enum(&mut ctx, pointer_first, u32_ty, 4);
             let error = build_enum_slot_map(&mut ctx, enum_ty)
                 .err()
-                .expect("pointer overlap must reject");
+                .expect("a 32-bit integer under half a pointer word must reject");
             assert!(
                 error.to_string().contains("pointer provenance"),
                 "pointer_first={pointer_first}: {error}"
             );
         }
+    }
+
+    /// Falsifier: a non-pointer word over the pointer niche carrier is the
+    /// discriminant, not payload storage. Promoting it to a `ptr` slot (or
+    /// sharing the carrier) would corrupt variant selection, so it stays
+    /// fail-closed even though the word is pointer-sized.
+    #[test]
+    fn enum_slot_map_rejects_overlay_into_pointer_niche_carrier() {
+        let mut ctx = make_ctx();
+        let logical = mir_uint(&mut ctx, 64);
+        let index = mir_uint(&mut ctx, 64);
+        let pointee = mir_uint(&mut ctx, 32);
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, pointee, false).into();
+        let payload: TypeHandle = MirTupleType::get(&mut ctx, vec![index, pointer]).into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "ShiftedPointerCarrier".into(),
+            logical,
+            vec![0, 1],
+            vec![
+                EnumVariant::unit("None".into()),
+                EnumVariant::new_with_layout("Some".into(), vec![payload], vec![0], vec![16]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 16,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Niche,
+                carrier_kind: EnumCarrierKind::Pointer,
+                carrier_width: 64,
+                untagged_variant: 1,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        let error = build_enum_slot_map(&mut ctx, enum_ty)
+            .err()
+            .expect("an integer word over the pointer carrier must stay fail-closed");
+        assert!(error.to_string().contains("pointer provenance"), "{error}");
     }
 
     #[test]
@@ -3928,5 +4403,679 @@ mod tests {
 
         let err = validate_initialized_global_layout(&mut ctx, niche, 4, 4).unwrap_err();
         assert!(err.to_string().contains("unknown physical layout"));
+    }
+
+    /// The trame `Result<Route, Failure>` shape, which is what the NV backend's
+    /// `init` / `Route::sized` / `Links::open` results hit. rustc gives the
+    /// `Result` an 8-byte discriminant, then lays `Route` (one integer
+    /// aggregate) and `Failure` over the same payload bytes from offset 8.
+    /// `Failure.operation` is a fat `&str` whose data pointer sits at byte 24,
+    /// inside `Route.words` (byte 24..32). The whole
+    /// `Route` claim must split around that pointer: `Route` becomes slotless
+    /// and round-trips through memory, and the pointer word gets a real `ptr`
+    /// slot so the `Err` variant keeps its provenance. This is the exact case
+    /// the scalar-u64 promotion rejects.
+    #[test]
+    fn enum_slot_map_splits_integer_aggregate_around_overlaid_pointer() {
+        let mut ctx = make_ctx();
+        let discr = mir_uint(&mut ctx, 64);
+        let u8_ty = mir_uint(&mut ctx, 8);
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let usize_ty = mir_uint(&mut ctx, 64);
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let route: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Route".into(),
+            vec![
+                "depth".into(),
+                "capacity".into(),
+                "slot_words".into(),
+                "words".into(),
+                "ranks".into(),
+            ],
+            vec![u32_ty, u32_ty, usize_ty, usize_ty, u32_ty],
+            vec![0, 1, 2, 3, 4],
+            vec![0, 4, 8, 16, 24],
+            32,
+            8,
+        )
+        .into();
+        let fat_pointer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "FatPointer".into(),
+            vec!["data".into(), "len".into()],
+            vec![pointer, usize_ty],
+            vec![0, 1],
+            vec![0, 8],
+            16,
+            8,
+        )
+        .into();
+        let failure: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Failure".into(),
+            vec!["participant".into(), "kind".into(), "operation".into()],
+            vec![u32_ty, u32_ty, fat_pointer],
+            vec![0, 1, 2],
+            vec![0, 8, 16],
+            32,
+            8,
+        )
+        .into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "RouteResult".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("Ok".into(), vec![route], vec![8], vec![32]),
+                EnumVariant::new_with_layout("Err".into(), vec![failure], vec![8], vec![32]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 40,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Direct,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 64,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        let map = build_enum_slot_map(&mut ctx, enum_ty)
+            .expect("the name pointer inside the route's integer words is representable");
+        assert_eq!(
+            llvm_type_size_align(&ctx, map.llvm_struct_ty),
+            Some((40, 8))
+        );
+        assert_eq!(
+            map.field_slots,
+            vec![None, None],
+            "the split `Route` claim and the slotless `Failure` field both round-trip through memory"
+        );
+        let mut leaves = Vec::new();
+        collect_llvm_pointer_storage(&ctx, map.llvm_struct_ty, 0, &mut leaves)
+            .expect("the split storage must walk");
+        assert_eq!(
+            leaves,
+            vec![LlvmPointerStorage {
+                offset: 24,
+                size: 8,
+                address_space: 0,
+            }],
+            "exactly the name pointer keeps a real `ptr` slot, at byte 24"
+        );
+    }
+
+    /// The trame `Result<Context, Failure>` returned by `nv::init`: the whole
+    /// `Context` aggregate (with its own arena/leader pointers) is overlaid by
+    /// the smaller `Failure`, whose fat `&str` pointer sits at byte 16 inside
+    /// `Context.launch`. A niche carrier is taken from a `Context` pointer, so
+    /// `Context` is already slotless; `Failure` still gets a whole aggregate
+    /// slot so its fat pointer is inserted and extracted as a pointer.
+    #[test]
+    fn enum_slot_map_keeps_context_payload_slotless_under_failure_overlay() {
+        let mut ctx = make_ctx();
+        let discr = mir_uint(&mut ctx, 32);
+        let u8_ty = mir_uint(&mut ctx, 8);
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let usize_ty = mir_uint(&mut ctx, 64);
+        let launch: TypeHandle = llvm_types::ArrayType::get(&ctx, u32_ty, 32).into();
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let context: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Context".into(),
+            vec![
+                "rank".into(),
+                "size".into(),
+                "launch".into(),
+                "arena".into(),
+                "leader".into(),
+            ],
+            vec![u32_ty, u32_ty, launch, pointer, pointer],
+            vec![0, 1, 2, 3, 4],
+            vec![0, 4, 8, 416, 480],
+            752,
+            8,
+        )
+        .into();
+        let fat_pointer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "FatPointer".into(),
+            vec!["data".into(), "len".into()],
+            vec![pointer, usize_ty],
+            vec![0, 1],
+            vec![0, 8],
+            16,
+            8,
+        )
+        .into();
+        let failure: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Failure".into(),
+            vec!["participant".into(), "kind".into(), "operation".into()],
+            vec![u32_ty, u32_ty, fat_pointer],
+            vec![0, 1, 2],
+            vec![0, 8, 16],
+            32,
+            8,
+        )
+        .into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "ContextResult".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("Ok".into(), vec![context], vec![0], vec![752]),
+                EnumVariant::new_with_layout("Err".into(), vec![failure], vec![0], vec![32]),
+            ],
+            EnumEncoding {
+                tag_offset: 416,
+                total_size: 752,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Niche,
+                carrier_kind: EnumCarrierKind::Pointer,
+                carrier_width: 64,
+                untagged_variant: 1,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        let map = build_enum_slot_map(&mut ctx, enum_ty)
+            .expect("the niche carrier and the overlaid failure aggregate are representable");
+        assert_eq!(
+            llvm_type_size_align(&ctx, map.llvm_struct_ty),
+            Some((752, 8))
+        );
+        assert_eq!(
+            map.field_slots[0], None,
+            "`Context` must round-trip through memory"
+        );
+        assert!(
+            map.field_slots[1].is_some(),
+            "`Failure` must keep a whole aggregate slot"
+        );
+        let mut leaves = Vec::new();
+        collect_llvm_pointer_storage(&ctx, map.llvm_struct_ty, 0, &mut leaves)
+            .expect("the storage must walk");
+        assert_eq!(
+            leaves,
+            vec![
+                LlvmPointerStorage {
+                    offset: 16,
+                    size: 8,
+                    address_space: 0,
+                },
+                LlvmPointerStorage {
+                    offset: 416,
+                    size: 8,
+                    address_space: 0,
+                },
+                LlvmPointerStorage {
+                    offset: 480,
+                    size: 8,
+                    address_space: 0,
+                },
+            ],
+            "both of `Context`'s live pointers must keep their own typed `ptr` slot"
+        );
+    }
+
+    /// The trame `Result<Leader, Failure>` shape: a niche `Result` whose `Err`
+    /// payload sits at byte 8 over `Leader`. `Leader.region` is a live pointer
+    /// at byte 8, and `Failure.operation`'s data pointer at byte 24 falls on
+    /// unclaimed integer bytes. The `Err` store slotlessly overwrites the dead
+    /// `region` word; `Failure` keeps a real `ptr` slot for its own name.
+    #[test]
+    fn enum_slot_map_lays_pointer_aggregate_over_foreign_dead_pointer() {
+        let mut ctx = make_ctx();
+        let discr = mir_uint(&mut ctx, 64);
+        let u8_ty = mir_uint(&mut ctx, 8);
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let usize_ty = mir_uint(&mut ctx, 64);
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let cursors: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Cursors".into(),
+            vec!["ptr".into(), "a".into(), "b".into()],
+            vec![pointer, usize_ty, usize_ty],
+            vec![0, 1, 2],
+            vec![0, 8, 16],
+            24,
+            8,
+        )
+        .into();
+        let route: TypeHandle = llvm_types::ArrayType::get(&ctx, u8_ty, 32).into();
+        let leader: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Leader".into(),
+            vec![
+                "me".into(),
+                "region".into(),
+                "route".into(),
+                "cursors".into(),
+            ],
+            vec![usize_ty, pointer, route, cursors],
+            vec![0, 1, 2, 3],
+            vec![0, 8, 16, 48],
+            72,
+            8,
+        )
+        .into();
+        let fat_pointer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "FatPointer".into(),
+            vec!["data".into(), "len".into()],
+            vec![pointer, usize_ty],
+            vec![0, 1],
+            vec![0, 8],
+            16,
+            8,
+        )
+        .into();
+        let failure: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Failure".into(),
+            vec!["participant".into(), "kind".into(), "operation".into()],
+            vec![u32_ty, u32_ty, fat_pointer],
+            vec![0, 1, 2],
+            vec![0, 8, 16],
+            32,
+            8,
+        )
+        .into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "LeaderResult".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("Ok".into(), vec![leader], vec![0], vec![72]),
+                EnumVariant::new_with_layout("Err".into(), vec![failure], vec![8], vec![32]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 72,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Niche,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 64,
+                untagged_variant: 1,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        let map = build_enum_slot_map(&mut ctx, enum_ty)
+            .expect("the `Err` store may overwrite the dead `region` word");
+        assert_eq!(
+            llvm_type_size_align(&ctx, map.llvm_struct_ty),
+            Some((72, 8))
+        );
+        assert_eq!(map.field_slots, vec![None, None]);
+        let mut leaves = Vec::new();
+        collect_llvm_pointer_storage(&ctx, map.llvm_struct_ty, 0, &mut leaves)
+            .expect("the storage must walk");
+        assert_eq!(
+            leaves,
+            vec![
+                LlvmPointerStorage {
+                    offset: 8,
+                    size: 8,
+                    address_space: 0,
+                },
+                LlvmPointerStorage {
+                    offset: 24,
+                    size: 8,
+                    address_space: 0,
+                },
+                LlvmPointerStorage {
+                    offset: 48,
+                    size: 8,
+                    address_space: 0,
+                },
+            ]
+        );
+    }
+
+    /// A pointer-free payload field that wholly contains another variant's
+    /// pointer word may round-trip through memory: its store overwrites a
+    /// pointer that is dead when this variant is live. This is the `Result`
+    /// shape whose `Ok` header sits at byte 8 over the `Err` variant's pointer
+    /// at byte 16. A pointer only *partly* covered stays refused (see
+    /// `enum_slot_map_rejects_partial_pointer_integer_overlap`).
+    #[test]
+    fn enum_slot_map_lays_pointer_free_aggregate_over_foreign_pointer_claim() {
+        let mut ctx = make_ctx();
+        let discr = mir_uint(&mut ctx, 32);
+        let u8_ty = mir_uint(&mut ctx, 8);
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let u64_ty = mir_uint(&mut ctx, 64);
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let with_pointer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "WithPointer".into(),
+            vec![
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "data".into(),
+                "d".into(),
+            ],
+            vec![u32_ty, u32_ty, u64_ty, pointer, u64_ty],
+            vec![0, 1, 2, 3, 4],
+            vec![0, 4, 8, 16, 24],
+            32,
+            8,
+        )
+        .into();
+        let header: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Header".into(),
+            vec!["a".into(), "b".into(), "c".into()],
+            vec![u64_ty, u64_ty, u64_ty],
+            vec![0, 1, 2],
+            vec![0, 8, 16],
+            24,
+            8,
+        )
+        .into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "HeaderResult".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("A".into(), vec![with_pointer], vec![0], vec![32]),
+                EnumVariant::new_with_layout("B".into(), vec![header], vec![8], vec![24]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 32,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Niche,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                untagged_variant: 1,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        let map = build_enum_slot_map(&mut ctx, enum_ty)
+            .expect("a pointer word the other payload fully covers is dead, not punned");
+        assert_eq!(
+            llvm_type_size_align(&ctx, map.llvm_struct_ty),
+            Some((32, 8))
+        );
+        assert_eq!(map.field_slots, vec![None, None]);
+        let mut leaves = Vec::new();
+        collect_llvm_pointer_storage(&ctx, map.llvm_struct_ty, 0, &mut leaves)
+            .expect("the storage must walk");
+        assert_eq!(
+            leaves,
+            vec![LlvmPointerStorage {
+                offset: 16,
+                size: 8,
+                address_space: 0,
+            }]
+        );
+    }
+
+    /// The trame `Result<Fabric, BackendFault>` shape in the other direction:
+    /// `BackendFault` is processed first and takes a whole claim at byte 4, and
+    /// the `Ok` arena pointer at byte 8 reaches past it. The claim's owner
+    /// becomes slotless and the pointer gets a real `ptr` slot; the pointer
+    /// bytes the owner does not cover (12..16) are zeroed when the owner's
+    /// variant is built.
+    #[test]
+    fn enum_slot_map_splits_claim_under_pointer_that_reaches_past_it() {
+        let mut ctx = make_ctx();
+        let discr = mir_uint(&mut ctx, 32);
+        let u8_ty = mir_uint(&mut ctx, 8);
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let u64_ty = mir_uint(&mut ctx, 64);
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let fault: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "BackendFaultLike".into(),
+            vec!["tag".into(), "payload".into()],
+            vec![u32_ty, u32_ty],
+            vec![0, 1],
+            vec![0, 4],
+            8,
+            4,
+        )
+        .into();
+        let fabric: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "FabricLike".into(),
+            vec![
+                "arena".into(),
+                "depth".into(),
+                "capacity".into(),
+                "a".into(),
+                "b".into(),
+            ],
+            vec![pointer, u32_ty, u32_ty, u64_ty, u64_ty],
+            vec![0, 1, 2, 3, 4],
+            vec![0, 8, 12, 16, 24],
+            32,
+            8,
+        )
+        .into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "FabricResult".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("Err".into(), vec![fault], vec![4], vec![8]),
+                EnumVariant::new_with_layout("Ok".into(), vec![fabric], vec![8], vec![32]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 40,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Niche,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                untagged_variant: 0,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        let map = build_enum_slot_map(&mut ctx, enum_ty)
+            .expect("the arena pointer may split a fault claim it reaches past");
+        assert_eq!(
+            llvm_type_size_align(&ctx, map.llvm_struct_ty),
+            Some((40, 8))
+        );
+        assert_eq!(map.field_slots, vec![None, None]);
+        assert_eq!(
+            map.field_partial_ptr_fills[0],
+            vec![(12, 4)],
+            "the pointer bytes past the fault payload are recorded for zeroing"
+        );
+        let mut leaves = Vec::new();
+        collect_llvm_pointer_storage(&ctx, map.llvm_struct_ty, 0, &mut leaves)
+            .expect("the storage must walk");
+        assert_eq!(
+            leaves,
+            vec![LlvmPointerStorage {
+                offset: 8,
+                size: 8,
+                address_space: 0,
+            }]
+        );
+    }
+
+    /// The trame `Result<Launched, BackendFault>` shape from the CUDA `init`
+    /// path: a niche `Result` whose `Ok` payload is the whole `Launched`
+    /// aggregate at byte 0 and whose `Err` payload is an 8-byte fault at byte 4.
+    /// `Launched` carries *two* live pointers (`fabric.arena` at byte 8 and
+    /// `leader_region` at byte 40) and the `Err` word partially covers the arena.
+    /// Both nested pointers must keep their own typed `ptr` slots; a byte/filler
+    /// view of the slotless `Launched` aggregate alone would lose their
+    /// provenance on an enum copy.
+    #[test]
+    fn enum_slot_map_backs_every_nested_launched_pointer_beside_fault_overlay() {
+        let mut ctx = make_ctx();
+        let discr = mir_uint(&mut ctx, 32);
+        let u8_ty = mir_uint(&mut ctx, 8);
+        let u16_ty = mir_uint(&mut ctx, 16);
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let u64_ty = mir_uint(&mut ctx, 64);
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let layout_bytes: TypeHandle = llvm_types::ArrayType::get(&ctx, u8_ty, 24).into();
+        let launched: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Launched".into(),
+            vec![
+                "leader".into(),
+                "arena".into(),
+                "layout".into(),
+                "leader_region".into(),
+                "leader_words".into(),
+                "size".into(),
+            ],
+            vec![u64_ty, pointer, layout_bytes, pointer, u64_ty, u32_ty],
+            vec![0, 1, 2, 3, 4, 5],
+            vec![0, 8, 16, 40, 48, 56],
+            64,
+            8,
+        )
+        .into();
+        let backend_fault: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "BackendFault".into(),
+            vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            vec![u8_ty, u8_ty, u16_ty, u32_ty],
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2, 4],
+            8,
+            4,
+        )
+        .into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "LaunchedResult".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("Ok".into(), vec![launched], vec![0], vec![64]),
+                EnumVariant::new_with_layout("Err".into(), vec![backend_fault], vec![4], vec![8]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 64,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Niche,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                untagged_variant: 1,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        let map = build_enum_slot_map(&mut ctx, enum_ty)
+            .expect("the fault word and the two `Launched` pointers are representable");
+        assert_eq!(
+            llvm_type_size_align(&ctx, map.llvm_struct_ty),
+            Some((64, 8))
+        );
+        assert_eq!(map.field_slots, vec![None, None]);
+        let mut leaves = Vec::new();
+        collect_llvm_pointer_storage(&ctx, map.llvm_struct_ty, 0, &mut leaves)
+            .expect("the storage must walk");
+        assert_eq!(
+            leaves,
+            vec![
+                LlvmPointerStorage {
+                    offset: 8,
+                    size: 8,
+                    address_space: 0,
+                },
+                LlvmPointerStorage {
+                    offset: 40,
+                    size: 8,
+                    address_space: 0,
+                },
+            ],
+            "both nested `Launched` pointers must keep their own typed `ptr` slot"
+        );
+    }
+
+    /// Falsifier: a pointer leaf may only split a claim that carries no
+    /// pointer. Overlaying a claim whose own pointer sits elsewhere is two
+    /// different pointers sharing bytes, which no single slot can preserve.
+    #[test]
+    fn enum_slot_map_rejects_pointer_into_pointer_bearing_aggregate() {
+        let mut ctx = make_ctx();
+        let discr = mir_uint(&mut ctx, 32);
+        let u8_ty = mir_uint(&mut ctx, 8);
+        let usize_ty = mir_uint(&mut ctx, 64);
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        // Variant A: {u64 @0, ptr @8}, pointer-free at byte 0.
+        let a: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "WithPointer".into(),
+            vec!["bits".into(), "data".into()],
+            vec![usize_ty, pointer],
+            vec![0, 1],
+            vec![0, 8],
+            16,
+            8,
+        )
+        .into();
+        // Variant B: a bare pointer at byte 0, where A holds only integers.
+        let b: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "BarePointer".into(),
+            vec!["data".into()],
+            vec![pointer],
+            vec![0],
+            vec![0],
+            8,
+            8,
+        )
+        .into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "PointerOverPointerAggregate".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("A".into(), vec![a], vec![8], vec![16]),
+                EnumVariant::new_with_layout("B".into(), vec![b], vec![8], vec![8]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 24,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Direct,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        let error = build_enum_slot_map(&mut ctx, enum_ty)
+            .err()
+            .expect("two different pointers cannot share the same bytes");
+        assert!(error.to_string().contains("pointer provenance"), "{error}");
     }
 }

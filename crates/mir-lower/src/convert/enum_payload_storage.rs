@@ -159,6 +159,8 @@ enum ValueCoercion {
     ByteToBool,
     SharedToGeneric,
     GenericToShared,
+    IntToPointer,
+    PointerToInt,
     Array {
         target_element: TypeHandle,
         count: u64,
@@ -199,6 +201,14 @@ pub(crate) fn coerce_enum_payload_value(
             ValueCoercion::BoolToByte
         } else if source_integer == Some(8) && target_integer == Some(1) {
             ValueCoercion::ByteToBool
+        } else if source_integer == Some(64) && target_ref.is::<llvm_types::PointerType>() {
+            // Overlaid pointer/integer enum storage uses a `ptr` slot for both
+            // variants, so the integer side crosses the boundary here. Every
+            // pointer in enum storage is a 64-bit generic pointer (see
+            // `llvm_type_size_align`), so the bit pattern is preserved exactly.
+            ValueCoercion::IntToPointer
+        } else if source_ref.is::<llvm_types::PointerType>() && target_integer == Some(64) {
+            ValueCoercion::PointerToInt
         } else if let (Some(source_pointer), Some(target_pointer)) = (
             source_ref.downcast_ref::<llvm_types::PointerType>(),
             target_ref.downcast_ref::<llvm_types::PointerType>(),
@@ -254,6 +264,16 @@ pub(crate) fn coerce_enum_payload_value(
         }
         ValueCoercion::SharedToGeneric | ValueCoercion::GenericToShared => {
             let cast = llvm::AddrSpaceCastOp::new(ctx, value, target_ty);
+            rewriter.insert_operation(ctx, cast.get_operation());
+            Ok(cast.get_operation().deref(ctx).get_result(0))
+        }
+        ValueCoercion::IntToPointer => {
+            let cast = llvm::IntToPtrOp::new(ctx, value, target_ty);
+            rewriter.insert_operation(ctx, cast.get_operation());
+            Ok(cast.get_operation().deref(ctx).get_result(0))
+        }
+        ValueCoercion::PointerToInt => {
+            let cast = llvm::PtrToIntOp::new(ctx, value, target_ty);
             rewriter.insert_operation(ctx, cast.get_operation());
             Ok(cast.get_operation().deref(ctx).get_result(0))
         }

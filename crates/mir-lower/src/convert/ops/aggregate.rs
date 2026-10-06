@@ -1016,7 +1016,7 @@ fn emit_carrier_constant(
 /// This is the value-level half of [`llvm_byte_faithful_twin`]: the enum
 /// slot map claims twin-typed storage for bool-bearing payloads, and this
 /// produces the twin-typed value the store into that storage needs.
-fn canonicalize_bool_value_bytes(
+pub(crate) fn canonicalize_bool_value_bytes(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     value: Value,
@@ -1234,6 +1234,19 @@ pub(crate) fn convert_construct_enum(
             coerce_enum_payload_storage(ctx, rewriter, canonical_operand, storage_ty)?;
         let store_op = llvm::StoreOp::new(ctx, stored_operand, field_ptr);
         rewriter.insert_operation(ctx, store_op.get_operation());
+        // The field only partly covers a foreign pointer word (the
+        // `Result<Launched, BackendFault>` `Err` payload over `Ok`'s arena).
+        // Zero the pointer bytes the field does not reach so the word this
+        // variant loads is fully defined; a later copy must not store `undef`
+        // over the field's own bytes inside that word.
+        for &(fill_offset, fill_size) in &slot_map.field_partial_ptr_fills[flat] {
+            for byte in 0..fill_size {
+                let fill_ptr = enum_byte_gep(ctx, rewriter, slot_ptr, fill_offset + byte);
+                let zero = emit_integer_constant(ctx, rewriter, 8, 0);
+                let fill_store = llvm::StoreOp::new(ctx, zero, fill_ptr);
+                rewriter.insert_operation(ctx, fill_store.get_operation());
+            }
+        }
     }
     let load_op = llvm::LoadOp::new(ctx, slot_ptr, llvm_struct_ty);
     rewriter.insert_operation(ctx, load_op.get_operation());
@@ -1683,23 +1696,44 @@ pub(crate) fn convert_field_addr(
         // from the field's semantic type: a bool is physically an i8 byte and
         // a shared-memory pointer is stored as a generic pointer, with the
         // value paths (construct/extract) coercing exactly at that boundary.
-        // The address computed here ESCAPES this site: the loads and stores
-        // made through it happen at arbitrary other sites and are typed with
-        // the SEMANTIC type, so no storage coercion can be attached at
-        // address-formation time. Handing the address out anyway would let an
-        // i1 store leave the byte's upper seven bits undefined for the i8 and
-        // niche-tag readers, or write a shared-pointer representation into
-        // bytes every other reader interprets (and, on modern NVVM, sizes) as
-        // a generic pointer. Fail closed instead, the same way the slot map
-        // already rejects bool bytes hidden behind unions.
+        // The pointer/integer overlay is the same kind of boundary: an integer
+        // field sharing a promoted slot is physically a `ptr`. The address
+        // computed here ESCAPES this site: the loads and stores made through it
+        // happen at arbitrary other sites and are typed with the SEMANTIC type,
+        // so no storage coercion can be attached at address-formation time.
+        // Handing the address out anyway would let an i1 store leave the byte's
+        // upper seven bits undefined for the i8 and niche-tag readers, write a
+        // shared-pointer representation into bytes every other reader
+        // interprets (and, on modern NVVM, sizes) as a generic pointer, or
+        // write integer bytes over a pointer whose provenance the enum must
+        // preserve. Fail closed instead, the same way the slot map already
+        // rejects bool bytes hidden behind unions.
         let semantic_ty = map.field_llvm_types[field_index];
-        let storage_ty = enum_payload_storage_type(ctx, semantic_ty).map_err(anyhow_to_pliron)?;
-        if storage_ty != semantic_ty {
+        let canonical_storage_ty =
+            enum_payload_storage_type(ctx, semantic_ty).map_err(anyhow_to_pliron)?;
+        // The slot is authoritative for what the bytes hold. A slotless field's
+        // bytes take its canonical storage type.
+        let bytes_ty = match slot_entry {
+            Some(slot) => {
+                let struct_ref = map.llvm_struct_ty.deref(ctx);
+                let struct_ty = struct_ref
+                    .downcast_ref::<llvm_types::StructType>()
+                    .ok_or_else(|| {
+                        pliron::input_error_noloc!(
+                            "field_addr: enum `{}` physical storage is not an LLVM struct",
+                            enum_name
+                        )
+                    })?;
+                struct_ty.field_type(slot as usize)
+            }
+            None => canonical_storage_ty,
+        };
+        if bytes_ty != semantic_ty {
             return pliron::input_err_noloc!(
                 "field_addr: cannot hand out the in-place address of payload field {} of enum `{}`: its bytes use canonical storage type {} while its semantic type is {}, and loads or stores made through an escaped payload address are typed with the semantic type, which the canonical bytes cannot honor; shared reads of such payloads are compiled through a value copy automatically, and a write that stays inside its function is compiled by rebuilding the enum around the new payload; a borrow that escapes into a call keeps no such rewrite and is refused here",
                 field_index,
                 enum_name,
-                storage_ty.deref(ctx).disp(ctx),
+                bytes_ty.deref(ctx).disp(ctx),
                 semantic_ty.deref(ctx).disp(ctx)
             );
         }
@@ -3524,6 +3558,65 @@ mod tests {
         );
     }
 
+    /// The pointer/integer overlay promotes an integer field's slot to a real
+    /// `ptr`. An escaped `&mut` to that field would be typed with the integer
+    /// type and would write integer bytes over a pointer the enum must carry
+    /// with provenance, so `field_addr` must refuse it exactly as it refuses a
+    /// bool or shared-pointer field.
+    #[test]
+    fn overlay_integer_payload_field_addr_fails_closed() {
+        let mut ctx = make_ctx();
+        let discr: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let u64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "PointerOrBits".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("Bits".into(), vec![u64_ty], vec![8], vec![8]),
+                EnumVariant::new_with_layout("Pointer".into(), vec![pointer], vec![8], vec![8]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 16,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Direct,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+        let enum_ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, enum_ty, true).into();
+        let bits_ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, u64_ty, true).into();
+
+        let (module, block) = build_kernel(&mut ctx, vec![enum_ptr_ty], vec![]);
+        let base = block.deref(&ctx).get_argument(0);
+        let op = Operation::new(
+            &mut ctx,
+            MirFieldAddrOp::get_concrete_op_info(),
+            vec![bits_ptr_ty],
+            vec![base],
+            vec![],
+            0,
+        );
+        MirFieldAddrOp::new(op).set_attr_field_index(&ctx, FieldIndexAttr(0));
+        op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        let err = crate::lower_mir_to_llvm(&mut ctx, module)
+            .expect_err("addressing the overlaid integer in place must fail to lower");
+        assert!(
+            err.err.to_string().contains("canonical storage type"),
+            "unexpected error: {}",
+            err.err
+        );
+    }
+
     /// A payload with no slot of its own is addressed at its byte offset off
     /// the ORIGINAL enum pointer: no stack spill is introduced, so a write
     /// through the result lands in the enum rather than in a copy.
@@ -4026,5 +4119,206 @@ mod tests {
             "a no-history shape that is not a slice fat pointer (with or without \
              the row-width word) must fail closed"
         );
+    }
+
+    #[test]
+    fn pointer_integer_overlay_round_trips_through_a_pointer_slot() {
+        // `#[repr(C)] enum PointerOrBits { Bits(u64), Pointer(*const u8) }`:
+        // both payloads occupy bytes 8..16. The slot map stores that word as a
+        // real `ptr`; `Bits` crosses the boundary with `inttoptr` on
+        // construction and `ptrtoint` on extraction, so the `Pointer` variant
+        // still loads a real pointer with provenance and `Bits` still moves all
+        // 64 bits. Nothing spills: the overlay is a slot, not a byte store.
+        let mut ctx = make_ctx();
+        let discr: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let u64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "PointerOrBits".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("Bits".into(), vec![u64_ty], vec![8], vec![8]),
+                EnumVariant::new_with_layout("Pointer".into(), vec![pointer], vec![8], vec![8]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 16,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Direct,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        let (module, block) = build_kernel(&mut ctx, vec![u64_ty], vec![u64_ty]);
+        let value = block.deref(&ctx).get_argument(0);
+        let construct = Operation::new(
+            &mut ctx,
+            MirConstructEnumOp::get_concrete_op_info(),
+            vec![enum_ty],
+            vec![value],
+            vec![],
+            0,
+        );
+        MirConstructEnumOp::new(construct)
+            .set_attr_construct_enum_variant_index(&ctx, VariantIndexAttr(0));
+        construct.insert_at_back(block, &ctx);
+        let enum_value = construct.deref(&ctx).get_result(0);
+
+        let payload = Operation::new(
+            &mut ctx,
+            MirEnumPayloadOp::get_concrete_op_info(),
+            vec![u64_ty],
+            vec![enum_value],
+            vec![],
+            0,
+        );
+        let payload_op = MirEnumPayloadOp::new(payload);
+        payload_op.set_attr_payload_variant_index(&ctx, VariantIndexAttr(0));
+        payload_op.set_attr_payload_field_index(&ctx, FieldIndexAttr(0));
+        payload.insert_at_back(block, &ctx);
+        let result = payload.deref(&ctx).get_result(0);
+        append_mir_return(&mut ctx, block, vec![result]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module).expect("lowering the overlay must succeed");
+        let body = kernel_blocks(&ctx, module);
+        assert_eq!(
+            count_ops::<llvm::IntToPtrOp>(&ctx, &body),
+            1,
+            "constructing Bits must place the integer into the pointer slot through inttoptr"
+        );
+        assert_eq!(
+            count_ops::<llvm::PtrToIntOp>(&ctx, &body),
+            1,
+            "extracting Bits must read the pointer slot back through ptrtoint"
+        );
+        assert_eq!(
+            count_ops::<llvm::StoreOp>(&ctx, &body),
+            0,
+            "the integer side must not spill or byte-store the pointer slot"
+        );
+        assert_eq!(count_ops::<llvm::LoadOp>(&ctx, &body), 0);
+    }
+
+    /// The trame CUDA `init` shape: `Result<Launched, BackendFault>`, with
+    /// `Launched` a slotless aggregate carrying two live pointers
+    /// (`fabric.arena` at byte 8 and `leader_region` at byte 40) and an 8-byte
+    /// fault at byte 4 partially covering the arena. Construction stores the
+    /// whole `Launched` and reloads the enum struct; extraction spills it again.
+    /// Both round-trips must carry the nested pointers in their typed `ptr`
+    /// slots, never through `ptrtoint`/`inttoptr`.
+    #[test]
+    fn launched_result_nested_pointers_survive_construction_and_extraction() {
+        let mut ctx = make_ctx();
+        let discr: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let u8_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let u16_ty: TypeHandle = IntegerType::get(&ctx, 16, Signedness::Unsigned).into();
+        let u32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Unsigned).into();
+        let u64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let pointer: TypeHandle = MirPtrType::get_generic(&mut ctx, u8_ty, false).into();
+        let layout_bytes: TypeHandle = llvm_types::ArrayType::get(&ctx, u8_ty, 24).into();
+        let launched: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Launched".into(),
+            vec![
+                "leader".into(),
+                "arena".into(),
+                "layout".into(),
+                "leader_region".into(),
+                "leader_words".into(),
+                "size".into(),
+            ],
+            vec![u64_ty, pointer, layout_bytes, pointer, u64_ty, u32_ty],
+            vec![0, 1, 2, 3, 4, 5],
+            vec![0, 8, 16, 40, 48, 56],
+            64,
+            8,
+        )
+        .into();
+        let backend_fault: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "BackendFault".into(),
+            vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            vec![u8_ty, u8_ty, u16_ty, u32_ty],
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2, 4],
+            8,
+            4,
+        )
+        .into();
+        let enum_ty: TypeHandle = MirEnumType::get_with_encoding(
+            &mut ctx,
+            "LaunchedResult".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::new_with_layout("Ok".into(), vec![launched], vec![0], vec![64]),
+                EnumVariant::new_with_layout("Err".into(), vec![backend_fault], vec![4], vec![8]),
+            ],
+            EnumEncoding {
+                tag_offset: 0,
+                total_size: 64,
+                abi_align: 8,
+                layout_kind: EnumLayoutKind::Niche,
+                carrier_kind: EnumCarrierKind::Integer,
+                carrier_width: 32,
+                untagged_variant: 1,
+                variant_inhabited: vec![1, 1],
+                ..EnumEncoding::default()
+            },
+        )
+        .into();
+
+        for (variant, field_ty) in [(0u32, launched), (1u32, backend_fault)] {
+            let (module, block) = build_kernel(&mut ctx, vec![field_ty], vec![field_ty]);
+            let value = block.deref(&ctx).get_argument(0);
+            let construct = Operation::new(
+                &mut ctx,
+                MirConstructEnumOp::get_concrete_op_info(),
+                vec![enum_ty],
+                vec![value],
+                vec![],
+                0,
+            );
+            MirConstructEnumOp::new(construct)
+                .set_attr_construct_enum_variant_index(&ctx, VariantIndexAttr(variant));
+            construct.insert_at_back(block, &ctx);
+            let enum_value = construct.deref(&ctx).get_result(0);
+
+            let payload = Operation::new(
+                &mut ctx,
+                MirEnumPayloadOp::get_concrete_op_info(),
+                vec![field_ty],
+                vec![enum_value],
+                vec![],
+                0,
+            );
+            let payload_op = MirEnumPayloadOp::new(payload);
+            payload_op.set_attr_payload_variant_index(&ctx, VariantIndexAttr(variant));
+            payload_op.set_attr_payload_field_index(&ctx, FieldIndexAttr(0));
+            payload.insert_at_back(block, &ctx);
+            let result = payload.deref(&ctx).get_result(0);
+            append_mir_return(&mut ctx, block, vec![result]);
+
+            crate::lower_mir_to_llvm(&mut ctx, module)
+                .expect("construction and extraction of the slotless aggregate must lower");
+            let body = kernel_blocks(&ctx, module);
+            assert_eq!(
+                count_ops::<llvm::PtrToIntOp>(&ctx, &body),
+                0,
+                "variant {variant}: a nested pointer must never be read as an integer"
+            );
+            assert_eq!(
+                count_ops::<llvm::IntToPtrOp>(&ctx, &body),
+                0,
+                "variant {variant}: a nested pointer must never be written from an integer"
+            );
+        }
     }
 }

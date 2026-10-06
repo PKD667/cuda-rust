@@ -51,9 +51,10 @@
 //! another aggregate participates, its already-physical LLVM bytes are copied
 //! through an exactly-sized, explicitly aligned stack slot.
 
+use super::aggregate::canonicalize_bool_value_bytes;
 use crate::convert::types::{
-    convert_type, llvm_type_contains_pointer_in_address_space, llvm_type_is_byte_faithful,
-    llvm_type_size_align,
+    convert_type, llvm_type_contains_i1, llvm_type_contains_pointer_in_address_space,
+    llvm_type_is_byte_faithful, llvm_type_size_align,
 };
 use crate::helpers;
 use dialect_mir::attributes::MirCastKindAttr;
@@ -793,6 +794,22 @@ fn emit_transmute_via_memory(
         );
     }
 
+    // A `[bool; 2]` and its byte-faithful twin have the same bytes
+    // (`core::array::IntoIter` transmutes `[bool; 2]` to
+    // `[MaybeUninit<bool>; 2]`). Widen every `i1` leaf to its canonical `i8`
+    // before the round-trip so the store writes the 0/1 bytes Rust's memory
+    // model guarantees; the destination then never observes unspecified upper
+    // bits. This is the same boundary `enum_payload_storage_type` uses.
+    let val_ty_is_aggregate = val_ty.deref(ctx).is::<llvm_export::types::StructType>()
+        || val_ty.deref(ctx).is::<llvm_export::types::ArrayType>();
+    let (val, val_ty) = if val_ty_is_aggregate && llvm_type_contains_i1(ctx, val_ty) {
+        let canonical = canonicalize_bool_value_bytes(ctx, rewriter, val)?;
+        let canonical_ty = canonical.get_type(ctx);
+        (canonical, canonical_ty)
+    } else {
+        (val, val_ty)
+    };
+
     // A memory round-trip can expose every stored byte through a different
     // destination type. Refuse a non-byte-faithful aggregate source: the
     // important example is `{ i1 }`, where LLVM may leave the upper seven
@@ -1197,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn transmute_from_bool_wrapper_rejects_unspecified_upper_byte_bits() {
+    fn transmute_from_bool_wrapper_canonicalizes_unspecified_upper_byte_bits() {
         let mut ctx = make_ctx();
         let boolean = int_ty(&mut ctx, 1, Signedness::Signless);
         let wrapper: TypeHandle = MirStructType::get_with_full_layout(
@@ -1212,14 +1229,19 @@ mod tests {
         )
         .into();
         let byte = int_ty(&mut ctx, 8, Signedness::Unsigned);
-        let module = build_single_cast(&mut ctx, wrapper, byte, MirCastKindAttr::Transmute);
+        let module = lower_single_cast(&mut ctx, wrapper, byte, MirCastKindAttr::Transmute);
 
-        let error = crate::lower_mir_to_llvm(&mut ctx, module)
-            .expect_err("aggregate bool storage must not be exposed as raw bytes");
-        assert!(
-            error.to_string().contains("not byte-faithful"),
-            "unexpected diagnostic: {error}"
+        let body = kernel_blocks(&ctx, module);
+        assert_eq!(
+            count_ops::<llvm::ZExtOp>(&ctx, &body),
+            1,
+            "the wrapper's bool leaf must be zero-extended to its canonical byte"
         );
+        // The canonicalization rebuilds the one-field wrapper through
+        // extract/insert, then the usual alloca/store/load round-trip runs.
+        assert_eq!(count_ops::<llvm::AllocaOp>(&ctx, &body), 1);
+        assert_eq!(count_ops::<llvm::StoreOp>(&ctx, &body), 1);
+        assert_eq!(count_ops::<llvm::LoadOp>(&ctx, &body), 1);
     }
 
     #[test]

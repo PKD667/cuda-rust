@@ -865,6 +865,7 @@ dependencies = [
  "oxide-artifacts",
  "pliron",
  "pliron-derive",
+ "reserved-oxide-symbols",
  "rustc-hash",
  "thiserror",
 ]

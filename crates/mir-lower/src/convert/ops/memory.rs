@@ -189,6 +189,127 @@ pub(crate) fn convert_memmove(
     convert_mem_transfer(ctx, rewriter, op, operands_info, "memmove")
 }
 
+/// Convert `mir.memset` to `llvm.memset.p<dst>.i<bits>`.
+///
+/// `mir.memset` backs `core::intrinsics::write_bytes`. Its count is in pointee elements, so it is
+/// scaled to bytes exactly as `mir.memcpy`'s is; the fill value is already the `i8` the intrinsic
+/// takes.
+pub(crate) fn convert_memset(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    operands_info: &OperandsInfo,
+) -> Result<()> {
+    let operands: Vec<_> = op.deref(ctx).operands().collect();
+    let (dst, value, count) = match operands.as_slice() {
+        [dst, value, count] => (*dst, *value, *count),
+        _ => return pliron::input_err_noloc!("memset operation requires exactly 3 operands"),
+    };
+
+    let pointee = {
+        let dst_ptr_ty = operands_info
+            .lookup_most_recent_of_type::<MirPtrType>(ctx, dst)
+            .ok_or_else(|| {
+                pliron::create_error!(
+                    op.deref(ctx).loc(),
+                    pliron::result::ErrorKind::VerificationFailed,
+                    pliron::result::StringError(
+                        "memset destination must be a MIR pointer before lowering".to_string()
+                    )
+                )
+            })?;
+        dst_ptr_ty.pointee
+    };
+    let elem_ty = convert_type(ctx, pointee).map_err(anyhow_to_pliron)?;
+    let elem_size = get_type_size(ctx, elem_ty);
+
+    let bytes = if elem_size == 1 {
+        count
+    } else {
+        let bits = count
+            .get_type(ctx)
+            .deref(ctx)
+            .downcast_ref::<IntegerType>()
+            .map(|ty| ty.width())
+            .unwrap_or(64);
+        let count_int_ty = IntegerType::get(ctx, bits, Signedness::Signless);
+        let size_attr: AttrObj = IntegerAttr::new(
+            count_int_ty,
+            APInt::from_u64(elem_size, std::num::NonZeroUsize::new(bits as usize).unwrap()),
+        )
+        .into();
+        let size_const = llvm::ConstantOp::new(ctx, size_attr);
+        let size_val = size_const.get_operation().deref(ctx).get_result(0);
+        rewriter.insert_operation(ctx, size_const.get_operation());
+        let flags = IntegerOverflowFlagsAttr::default();
+        let mul = llvm::MulOp::new_with_overflow_flag(ctx, count, size_val, flags);
+        rewriter.insert_operation(ctx, mul.get_operation());
+        mul.get_operation().deref(ctx).get_result(0)
+    };
+
+    let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+    let false_attr: AttrObj = IntegerAttr::new(
+        i1_ty,
+        APInt::from_u64(0, std::num::NonZeroUsize::new(1).unwrap()),
+    )
+    .into();
+    let volatile = llvm::ConstantOp::new(ctx, false_attr);
+    rewriter.insert_operation(ctx, volatile.get_operation());
+    let volatile_val = volatile.get_operation().deref(ctx).get_result(0);
+
+    let void_ty = VoidType::get(ctx);
+    let func_ty = FuncType::get(
+        ctx,
+        void_ty.into(),
+        vec![
+            dst.get_type(ctx),
+            value.get_type(ctx),
+            bytes.get_type(ctx),
+            volatile_val.get_type(ctx),
+        ],
+        false,
+    );
+    let parent_block = op.deref(ctx).get_parent_block().ok_or_else(|| {
+        pliron::create_error!(
+            op.deref(ctx).loc(),
+            pliron::result::ErrorKind::VerificationFailed,
+            pliron::result::StringError("memset operation has no parent block".to_string())
+        )
+    })?;
+    let dst_as = dst
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<llvm_export::types::PointerType>()
+        .map(|pt| pt.address_space())
+        .unwrap_or(0);
+    let len_bits = bytes
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .map(|t| t.width())
+        .unwrap_or(64);
+    let intrinsic_name = format!("llvm_memset_p{dst_as}_i{len_bits}");
+    helpers::ensure_intrinsic_declared(ctx, parent_block, &intrinsic_name, func_ty)
+        .map_err(anyhow_to_pliron)?;
+
+    let callee: Identifier = intrinsic_name.as_str().try_into().map_err(|e| {
+        pliron::create_error!(
+            op.deref(ctx).loc(),
+            pliron::result::ErrorKind::VerificationFailed,
+            pliron::result::StringError(format!("Invalid memset intrinsic name: {e:?}"))
+        )
+    })?;
+    let call = llvm::CallOp::new(
+        ctx,
+        CallOpCallable::Direct(callee),
+        func_ty,
+        vec![dst, value, bytes, volatile_val],
+    );
+    rewriter.insert_operation(ctx, call.get_operation());
+    rewriter.erase_operation(ctx, op);
+    Ok(())
+}
+
 /// Shared lowering for `mir.memcpy` / `mir.memmove`. `intrinsic_base` selects
 /// the LLVM intrinsic family ("memcpy" or "memmove"); both share the same
 /// `(dst, src, len_bytes, isvolatile)` signature and element->byte count scaling.

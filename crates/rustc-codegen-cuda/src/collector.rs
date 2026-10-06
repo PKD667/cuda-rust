@@ -1601,6 +1601,10 @@ impl<'tcx> DeviceCollector<'tcx> {
         if !resolved.def_id().is_local()
             && let Some(shim) = rust_alloc_shim_name(&raw_name)
         {
+            // A `#[device_allocator]` serves the allocator shims; without one they are refused.
+            if self.serve_alloc_shim(shim, &callee_ctx) {
+                return;
+            }
             self.report_heap_allocation(shim, caller, &callee_ctx);
         }
 
@@ -2089,6 +2093,79 @@ impl<'tcx> DeviceCollector<'tcx> {
     /// `shim` is the allocator entry point that was reached, `caller` is
     /// the collected function whose body contains the call, and `ctx`
     /// carries the originating root and the nearest user-code span.
+    /// Serves a Rust allocator shim from the program's `#[device_allocator]`, returning whether
+    /// the shim is handled so the caller must not report it.
+    ///
+    /// The four allocation shims are redirected: the registered `#[device]` function is enqueued
+    /// under the fixed export symbol the importer calls in place of the shim. The other two
+    /// shims need no device function. `handle_alloc_error` diverges and lowers to a trap, and
+    /// the no-alloc-shim marker is a no-op; both are the importer's, and neither is reachable
+    /// from device code that does not already allocate.
+    fn serve_alloc_shim(&mut self, shim: &str, ctx: &DiscoveryCtx) -> bool {
+        if shim == "handle_alloc_error" || shim == "__rust_no_alloc_shim_is_unstable_v2" {
+            return true;
+        }
+        let Some(entry) = reserved_oxide_symbols::alloc_shim(shim) else {
+            return false;
+        };
+        let Some(instance) = self.find_device_allocator(entry.device_fn) else {
+            return false;
+        };
+        let mangled = self.tcx.symbol_name(instance).name.to_string();
+        if self.seen.contains(&mangled) {
+            return true;
+        }
+        let export_name = entry.export.to_string();
+        if self.verbose {
+            eprintln!("[collector] Device allocator `{shim}` -> {export_name}");
+        }
+        self.discovery.insert(
+            mangled.clone(),
+            DiscoveryCtx {
+                root_name: ctx.root_name.clone(),
+                root_is_kernel: ctx.root_is_kernel,
+                user_span: ctx.user_span,
+            },
+        );
+        self.seen.insert(mangled);
+        self.used_export_names.insert(export_name.clone());
+        self.worklist.push_back(CollectedFunction {
+            instance,
+            is_kernel: false,
+            export_name,
+        });
+        true
+    }
+
+    /// The `#[device_allocator]` function named `device_fn`, in this crate or any dependency.
+    ///
+    /// Found among a crate's exported non-generic symbols: `#[device]` marks a non-generic function
+    /// `#[no_mangle]`, so it is exported by the crate that defines it, and a dependency's MIR is available
+    /// under `-Zalways-encode-mir`.
+    fn find_device_allocator(&self, device_fn: &str) -> Option<Instance<'tcx>> {
+        use rustc_middle::middle::exported_symbols::ExportedSymbol;
+        let wanted = format!("{}{device_fn}", reserved_oxide_symbols::DEVICE_PREFIX);
+        std::iter::once(LOCAL_CRATE)
+            .chain(self.tcx.crates(()).iter().copied())
+            .find_map(|krate| {
+                self.tcx
+                    .exported_non_generic_symbols(krate)
+                    .iter()
+                    .find_map(|(symbol, _)| match *symbol {
+                        ExportedSymbol::NonGeneric(def_id)
+                            if self
+                                .tcx
+                                .opt_item_name(def_id)
+                                .is_some_and(|name| name.as_str() == wanted) =>
+                        {
+                            Some(def_id)
+                        }
+                        _ => None,
+                    })
+            })
+            .map(|def_id| Instance::mono(self.tcx, def_id))
+    }
+
     fn report_heap_allocation(
         &self,
         shim: &str,
@@ -2119,7 +2196,9 @@ impl<'tcx> DeviceCollector<'tcx> {
             )
             .with_help(
                 "store the data in a fixed-size array `[T; N]` instead, or in a \
-                 `SharedArray` when the scratch space should be shared by the thread block",
+                 `SharedArray` when the scratch space should be shared by the thread block, or \
+                 register a device heap with `#[device_allocator] static HEAP: ...` \
+                 (`cuda_device::device_allocator`)",
             )
             .emit()
     }

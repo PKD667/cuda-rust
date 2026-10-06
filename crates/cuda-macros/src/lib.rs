@@ -6786,6 +6786,97 @@ pub fn device(_attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Serve the Rust allocator shims (`Vec`, `Box`, `String`) in device code from a `GlobalAlloc`.
+///
+/// ```rust,ignore
+/// #[device_allocator]
+/// static HEAP: Arena = Arena::new();
+/// ```
+///
+/// This is deliberately not `#[global_allocator]`: that is the allocator of the whole program,
+/// host included, and a device arena must not be the host's heap. The static stays an ordinary
+/// static. What the attribute adds is four `#[device]` functions that forward the allocator entry
+/// points to the `GlobalAlloc` methods of that static, which the collector finds by name and
+/// calls where device code reaches `__rust_alloc` and its three siblings. Without one, a kernel
+/// that allocates is still refused.
+///
+/// The Rust allocator shims take a `core::ptr::Alignment`, so the crate that uses this attribute
+/// must enable the nightly feature `ptr_alignment_type`.
+#[proc_macro_attribute]
+pub fn device_allocator(attr: TokenStream, item: TokenStream) -> TokenStream {
+    track_codegen_environment();
+    if let Some(token) = attr.into_iter().next() {
+        return syn::Error::new(token.span().into(), "`#[device_allocator]` takes no arguments")
+            .to_compile_error()
+            .into();
+    }
+    let input = match syn::parse::<syn::ItemStatic>(item) {
+        Ok(input) => input,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    let name = &input.ident;
+    let vis = &input.vis;
+    let alloc = format_ident!("{}", reserved_oxide_symbols::ALLOC_SHIMS[0].device_fn);
+    let zeroed = format_ident!("{}", reserved_oxide_symbols::ALLOC_SHIMS[1].device_fn);
+    let dealloc = format_ident!("{}", reserved_oxide_symbols::ALLOC_SHIMS[2].device_fn);
+    let realloc = format_ident!("{}", reserved_oxide_symbols::ALLOC_SHIMS[3].device_fn);
+    // The shims take `align: core::ptr::Alignment`, a newtype over an enum, which lowers to a
+    // struct and not to the `usize` it holds. The generated functions take the same type so the
+    // importer's call and the callee agree by construction; this is why the crate using the
+    // attribute must enable `ptr_alignment_type`.
+    let expanded = quote! {
+        #input
+
+        #[::cuda_device::device]
+        #[allow(dead_code)]
+        #vis fn #alloc(size: usize, align: ::core::ptr::Alignment) -> *mut u8 {
+            unsafe {
+                ::core::alloc::GlobalAlloc::alloc(
+                    &#name,
+                    ::core::alloc::Layout::from_size_align_unchecked(size, align.as_usize()),
+                )
+            }
+        }
+
+        #[::cuda_device::device]
+        #[allow(dead_code)]
+        #vis fn #zeroed(size: usize, align: ::core::ptr::Alignment) -> *mut u8 {
+            unsafe {
+                ::core::alloc::GlobalAlloc::alloc_zeroed(
+                    &#name,
+                    ::core::alloc::Layout::from_size_align_unchecked(size, align.as_usize()),
+                )
+            }
+        }
+
+        #[::cuda_device::device]
+        #[allow(dead_code)]
+        #vis fn #dealloc(ptr: *mut u8, size: usize, align: ::core::ptr::Alignment) {
+            unsafe {
+                ::core::alloc::GlobalAlloc::dealloc(
+                    &#name,
+                    ptr,
+                    ::core::alloc::Layout::from_size_align_unchecked(size, align.as_usize()),
+                )
+            }
+        }
+
+        #[::cuda_device::device]
+        #[allow(dead_code)]
+        #vis fn #realloc(ptr: *mut u8, size: usize, align: ::core::ptr::Alignment, new_size: usize) -> *mut u8 {
+            unsafe {
+                ::core::alloc::GlobalAlloc::realloc(
+                    &#name,
+                    ptr,
+                    ::core::alloc::Layout::from_size_align_unchecked(size, align.as_usize()),
+                    new_size,
+                )
+            }
+        }
+    };
+    expanded.into()
+}
+
 /// Generate a device function definition.
 ///
 /// Renames the function into the reserved `cuda_oxide_device_<hash>_` namespace

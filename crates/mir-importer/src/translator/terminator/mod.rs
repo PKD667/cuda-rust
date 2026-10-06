@@ -1336,6 +1336,26 @@ fn translate_call(
         );
     }
 
+    // The Rust allocator shims that `Vec` and `Box` end in have no body. The collector enqueued
+    // the program's `#[device_allocator]` functions under fixed symbols, so the call goes to
+    // those; the no-alloc marker has nothing to do on a device. `handle_alloc_error` diverges
+    // and is trapped by the diverging-call arm above.
+    let mut call_name = call_name;
+    if let Some(ref name) = pattern_name
+        && (name.starts_with("alloc::") || name.starts_with("std::alloc::"))
+        && let Some(shim) = name.rsplit("::").next()
+    {
+        if shim == "__rust_no_alloc_shim_is_unstable_v2" {
+            if let Some(target_idx) = target_usize {
+                return Ok(emit_elided_call_goto(
+                    ctx, target_idx, block_ptr, prev_op, block_map, loc,
+                ));
+            }
+        } else if let Some(entry) = reserved_oxide_symbols::alloc_shim(shim) {
+            call_name = Some(entry.export.to_string());
+        }
+    }
+
     // Not an intrinsic - emit regular function call
     let raw_name = call_name.unwrap_or_else(|| "unknown_function".to_string());
     let legal_name = legaliser.legalise(&raw_name);
@@ -2166,6 +2186,188 @@ fn extract_func_info(
     })
 }
 
+/// Emit `core::intrinsics::size_of_val::<T>` or `align_of_val::<T>` for a sized `T` as the constant
+/// `size_of::<T>()` or `align_of::<T>()`.
+///
+/// `Box`'s drop and `Layout::for_value` reach these with a concrete `T`, so the answer is rustc's
+/// layout and the pointer argument is not read. An unsized `T` (a slice, `str` or `dyn`) needs the
+/// fat pointer's metadata, which this does not lower, so it is refused by name.
+#[allow(clippy::too_many_arguments)]
+fn emit_layout_of_val(
+    ctx: &mut Context,
+    body: &mir::Body,
+    func: &mir::Operand,
+    align: bool,
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use pliron::builtin::attributes::IntegerAttr;
+    use pliron::utils::apint::APInt;
+    use rustc_public::ty::{GenericArgKind, RigidTy, TyKind};
+    use std::num::NonZeroUsize;
+
+    let _ = body;
+    let pointee = match func {
+        mir::Operand::Constant(constant) => match constant.const_.ty().kind() {
+            TyKind::RigidTy(RigidTy::FnDef(_, substs)) => substs.0.iter().find_map(|arg| match arg {
+                GenericArgKind::Type(ty) => Some(*ty),
+                _ => None,
+            }),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(pointee) = pointee else {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported("size_of_val / align_of_val without a type argument".to_string())
+        );
+    };
+    let size = match pointee.layout().map(|layout| layout.shape()) {
+        Ok(shape) if shape.is_sized() && align => shape.abi_align as u64,
+        Ok(shape) if shape.is_sized() => shape.size.bytes() as u64,
+        _ => {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "size_of_val / align_of_val of the unsized type {pointee:?} is not lowered on the device"
+                ))
+            );
+        }
+    };
+
+    let usize_ty = IntegerType::get(ctx, 64, Signedness::Unsigned);
+    let size_op = Operation::new(
+        ctx,
+        MirConstantOp::get_concrete_op_info(),
+        vec![usize_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    size_op.deref_mut(ctx).set_loc(loc.clone());
+    MirConstantOp::new(size_op).set_attr_value(
+        ctx,
+        IntegerAttr::new(usize_ty, APInt::from_u64(size, NonZeroUsize::new(64).unwrap())),
+    );
+    match prev_op {
+        Some(prev) => size_op.insert_after(ctx, prev),
+        None => size_op.insert_at_front(block_ptr, ctx),
+    }
+    let size_val = size_op.deref(ctx).get_result(0);
+    let goto_prev = value_map
+        .store_local(ctx, destination.local, size_val, block_ptr, Some(size_op))
+        .unwrap_or(size_op);
+
+    if let Some(target_idx) = target {
+        Ok(helpers::emit_goto(ctx, *target_idx, goto_prev, block_map, loc))
+    } else {
+        input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "size_of_val / align_of_val call without target not supported".to_string()
+            )
+        )
+    }
+}
+
+/// Emit `core::intrinsics::write_bytes` (`ptr::write_bytes`) as a `mir.memset`.
+///
+/// The intrinsic's operands are `(dst, val, count)`, `count` in pointee elements, which is the
+/// order `mir.memset` takes. It returns `()`, so a unit value is produced for the destination
+/// before branching to the target, as `emit_ptr_memmove` does.
+#[allow(clippy::too_many_arguments)]
+fn emit_ptr_memset(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use dialect_mir::ops::{MirConstructTupleOp, MirMemsetOp};
+    use dialect_mir::types::MirTupleType;
+
+    if args.len() != 3 {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "ptr::write_bytes intrinsic requires (dst, val, count) operands".to_string()
+            )
+        );
+    }
+    let (dst, last) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+    let (value, last) =
+        rvalue::translate_operand(ctx, body, &args[1], value_map, block_ptr, last, loc.clone())?;
+    let (count, last) =
+        rvalue::translate_operand(ctx, body, &args[2], value_map, block_ptr, last, loc.clone())?;
+
+    let fill = Operation::new(
+        ctx,
+        MirMemsetOp::get_concrete_op_info(),
+        vec![],
+        vec![dst, value, count],
+        vec![],
+        0,
+    );
+    fill.deref_mut(ctx).set_loc(loc.clone());
+    match last {
+        Some(p) => fill.insert_after(ctx, p),
+        None => fill.insert_at_front(block_ptr, ctx),
+    }
+
+    let unit_ty = MirTupleType::get(ctx, vec![]);
+    let unit_op = Operation::new(
+        ctx,
+        MirConstructTupleOp::get_concrete_op_info(),
+        vec![unit_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    unit_op.deref_mut(ctx).set_loc(loc.clone());
+    unit_op.insert_after(ctx, fill);
+    let unit_val = unit_op.deref(ctx).get_result(0);
+
+    let goto_prev = value_map
+        .store_local(ctx, destination.local, unit_val, block_ptr, Some(unit_op))
+        .unwrap_or(unit_op);
+
+    if let Some(target_idx) = target {
+        Ok(helpers::emit_goto(
+            ctx,
+            *target_idx,
+            goto_prev,
+            block_map,
+            loc,
+        ))
+    } else {
+        input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "ptr::write_bytes intrinsic call without target not supported".to_string()
+            )
+        )
+    }
+}
+
 /// Emit `core::intrinsics::copy` (`ptr::copy`) as a `mir.memmove`.
 ///
 /// rustc's intrinsic argument order is `(src, dst, count)` with `count` in
@@ -2613,6 +2815,38 @@ fn try_dispatch_intrinsic(
                 block_map,
                 loc,
                 name,
+            )?))
+        }
+        "core::intrinsics::size_of_val"
+        | "std::intrinsics::size_of_val"
+        | "core::intrinsics::align_of_val"
+        | "std::intrinsics::align_of_val" => {
+            Ok(Some(emit_layout_of_val(
+                ctx,
+                body,
+                func,
+                name.ends_with("align_of_val"),
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
+        "core::intrinsics::write_bytes" | "std::intrinsics::write_bytes" => {
+            Ok(Some(emit_ptr_memset(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
             )?))
         }
         "core::intrinsics::copy" | "std::intrinsics::copy" => Ok(Some(emit_ptr_memmove(

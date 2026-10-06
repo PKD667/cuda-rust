@@ -403,6 +403,66 @@ impl Verify for MirMemcpyOp {
 }
 
 // ============================================================================
+// MirMemsetOp
+// ============================================================================
+
+/// MIR memset operation.
+///
+/// Fills `count` elements at `dst` with the byte `value`. Backs
+/// `core::intrinsics::write_bytes` (`ptr::write_bytes`), which `vec![0; n]` and
+/// `alloc_zeroed` reach. The count is element-count, not byte-count, matching
+/// `mir.memcpy`; the lowering scales it by the pointee size.
+///
+/// # Operands
+///
+/// ```text
+/// | Name    | Type         | Description                          |
+/// |---------|--------------|--------------------------------------|
+/// | `dst`   | MirPtrType   | Destination pointer                  |
+/// | `value` | Integer (i8) | The byte every destination byte gets |
+/// | `count` | Integer      | Number of pointee elements to fill   |
+/// ```
+///
+/// # Verification
+///
+/// - Destination must be a `MirPtrType`.
+/// - Value and count must be integers.
+#[pliron_op(
+    name = "mir.memset",
+    format,
+    interfaces = [NOpdsInterface<3>, NResultsInterface<0>]
+)]
+pub struct MirMemsetOp;
+
+impl MirMemsetOp {
+    /// Create a new MirMemsetOp wrapper.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        MirMemsetOp { op }
+    }
+}
+
+impl Verify for MirMemsetOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        let op = &*self.get_operation().deref(ctx);
+        let dst_ty = op.get_operand(0).get_type(ctx);
+        let value_ty = op.get_operand(1).get_type(ctx);
+        let count_ty = op.get_operand(2).get_type(ctx);
+
+        if dst_ty.deref(ctx).downcast_ref::<MirPtrType>().is_none() {
+            return verify_err!(op.loc(), "MirMemsetOp destination must be a MirPtrType");
+        }
+        if value_ty.deref(ctx).downcast_ref::<IntegerType>().is_none() {
+            return verify_err!(op.loc(), "MirMemsetOp value must be an integer");
+        }
+        if count_ty.deref(ctx).downcast_ref::<IntegerType>().is_none() {
+            return verify_err!(op.loc(), "MirMemsetOp count must be an integer");
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
 // MirMemmoveOp
 // ============================================================================
 
@@ -1177,6 +1237,7 @@ pub fn register(ctx: &mut Context) {
     MirStoreOp::register(ctx);
     MirMemcpyOp::register(ctx);
     MirMemmoveOp::register(ctx);
+    MirMemsetOp::register(ctx);
     MirLoadOp::register(ctx);
     MirRefOp::register(ctx);
     MirPtrOffsetOp::register(ctx);

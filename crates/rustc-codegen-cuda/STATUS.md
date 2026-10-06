@@ -15,7 +15,7 @@ Run `scripts/check-error-example-status.sh` to verify both are in sync.
 | :------------------------------------ | :------------------ | :---------------------------------- |
 | `error`                               | diagnostics-fixture | `core::fmt` reachable from device   |
 | `error_enum_bool_payload_addr`        | diagnostics-fixture | `&mut` to a canonical-byte payload  |
-| `error_enum_pointer_overlap`          | support-gap         | Overlaid pointer/integer payload    |
+| `error_enum_pointer_overlap`          | support-gap         | Partial pointer/integer word overlap|
 | `error_enum_shared_pointer_layout`    | support-gap         | AS3 pointer arrays/vectors in enums |
 | `error_generated_intrinsic_abi`       | diagnostics-fixture | Unsupported raw intrinsic ABI       |
 | `error_generated_intrinsic_callable`  | diagnostics-fixture | Raw intrinsic passed through `Fn`   |
@@ -38,13 +38,34 @@ drop glue whose MIR uses constructs the pipeline cannot yet translate
 compilation with a diagnostic. Destructors are never silently skipped:
 a drop is either proven unobservable or its call is emitted.
 
-The remaining enum storage fixtures deliberately fail closed. Pointer and
-integer payloads cannot share one lowered slot without erasing LLVM pointer
-provenance. Shared-memory pointers are 64 bits in PTX and legacy NVVM output
-but 32 bits in modern NVVM output. Direct fields and pointer leaves nested
-through structs/tuples use target-stable generic physical storage, with
-recursive reconstruction at enum construction and extraction boundaries.
-Arrays and vectors containing shared pointers remain rejected: arrays need an
-explicit expansion bound and code-shape contract, while pointer vectors need
-separate ABI and address-space-cast semantics. (Bool leaves use canonical i8
-physical bytes and are converted recursively at the same boundary.)
+`error_heap_alloc` is the diagnostic for a kernel that allocates when the program registers no
+device allocator. A program registers one with `#[device_allocator] static HEAP: A = A;`
+(`cuda_device::device_allocator`, `A: GlobalAlloc`; the using crate enables the nightly feature
+`ptr_alignment_type`). The collector then serves `__rust_alloc`, `__rust_alloc_zeroed`,
+`__rust_dealloc` and `__rust_realloc` from the four `#[device]` functions the attribute generates,
+`handle_alloc_error` traps, and `Vec`, `Box` and `vec![]` compile. The attribute is not
+`#[global_allocator]`: that is the allocator of the host program too. Lowering `Vec` needed
+`ptr::write_bytes` (`mir.memset`) and `size_of_val`/`align_of_val` for sized types. Still refused:
+`size_of_val` of an unsized type, and anything reaching `core::fmt` or a `dyn` vtable.
+
+The remaining enum storage fixtures deliberately fail closed. A pointer word
+and a *whole* pointer-sized integer word may share bytes: the shared bytes are
+stored as a real `ptr` and the integer side crosses the boundary with
+`inttoptr`/`ptrtoint`, so the pointer variant keeps its provenance and the
+integer variant keeps all 64 bits (the `enum_pointer_overlay` example). A
+pointer-free payload that shares bytes with another variant's pointer is also
+representable: a pointer leaf may split a pointer-free byte-faithful aggregate
+it sits in or reaches past (the `Result<Route, Failure>` / `Result<Fabric,
+BackendFault>` shapes), and a pointer-free field that reaches past a foreign
+pointer word is stored slotlessly with the pointer bytes it does not cover
+zeroed (`Result<Launched, BackendFault>`). A pointer only *partly* covered by
+an integer strictly inside it stays refused, because no single slot type is
+both provenance-carrying and integer-exact. Shared-memory pointers are 64 bits
+in PTX and legacy NVVM output but 32 bits in modern NVVM output. Direct fields
+and pointer leaves nested through structs/tuples use target-stable generic
+physical storage, with recursive reconstruction at enum construction and
+extraction boundaries. Arrays and vectors containing shared pointers remain
+rejected: arrays need an explicit expansion bound and code-shape contract,
+while pointer vectors need separate ABI and address-space-cast semantics.
+(Bool leaves use canonical i8 physical bytes and are converted recursively at
+the same boundary.)

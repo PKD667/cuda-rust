@@ -117,6 +117,35 @@ pub const DEVICE_PREFIX: &str = "cuda_oxide_codegen_v1_cuda_oxide_device_246e25d
 /// Device-function prefix emitted before the scoped Cargo cache protocol.
 pub const LEGACY_DEVICE_PREFIX: &str = "cuda_oxide_device_246e25db_";
 
+/// One Rust global-allocator entry point and what serves it on the device.
+///
+/// `rust` is the bare name of the `alloc` shim device code reaches (`Vec` and `Box` end in
+/// these). `device_fn` is the `#[device]` function `#[device_allocator]` generates for it, and
+/// `export` is the fixed symbol the importer calls, so the importer and the collector agree on
+/// the target without sharing a registry.
+pub struct AllocShim {
+    pub rust: &'static str,
+    pub device_fn: &'static str,
+    pub export: &'static str,
+}
+
+/// The four shims `#[device_allocator]` serves.
+pub const ALLOC_SHIMS: [AllocShim; 4] = [
+    AllocShim { rust: "__rust_alloc", device_fn: "__device_alloc", export: "cuda_oxide_rust_alloc" },
+    AllocShim {
+        rust: "__rust_alloc_zeroed",
+        device_fn: "__device_alloc_zeroed",
+        export: "cuda_oxide_rust_alloc_zeroed",
+    },
+    AllocShim { rust: "__rust_dealloc", device_fn: "__device_dealloc", export: "cuda_oxide_rust_dealloc" },
+    AllocShim { rust: "__rust_realloc", device_fn: "__device_realloc", export: "cuda_oxide_rust_realloc" },
+];
+
+/// The shim whose bare name is `rust`, if it is one `#[device_allocator]` serves.
+pub fn alloc_shim(rust: &str) -> Option<&'static AllocShim> {
+    ALLOC_SHIMS.iter().find(|shim| shim.rust == rust)
+}
+
 /// Prefix added to functions inside `#[device] extern "C" { ... }` blocks.
 ///
 /// `#[device] extern "C" { fn foo(); }` becomes

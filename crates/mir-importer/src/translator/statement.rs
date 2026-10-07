@@ -72,6 +72,7 @@ pub fn translate_statement(
     value_map: &mut ValueMap,
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
+    legaliser: &mut pliron::identifier::Legaliser,
 ) -> TranslationResult<Option<Ptr<Operation>>> {
     let loc = span_to_location(ctx, stmt.span);
 
@@ -132,6 +133,7 @@ pub fn translate_statement(
                 block_ptr,
                 prev_op,
                 loc.clone(),
+                legaliser,
             )?;
 
             // Map the result to the place (local variable)

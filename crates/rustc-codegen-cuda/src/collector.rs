@@ -1095,6 +1095,9 @@ impl<'tcx> DeviceCollector<'tcx> {
                     if !reachable.contains(bb) {
                         continue;
                     }
+                    for statement in &bb_data.statements {
+                        self.process_statement(statement, &func, &ctx);
+                    }
                     if let Some(ref terminator) = bb_data.terminator {
                         self.process_terminator(terminator, mir, &func, &ctx);
                     }
@@ -1159,6 +1162,72 @@ impl<'tcx> DeviceCollector<'tcx> {
         attrs.is_readonly = check("readonly");
 
         attrs
+    }
+
+    /// Collect the function whose address a statement takes.
+    ///
+    /// `let f: fn(u32) -> u32 = inc;` is a `ReifyFnPointer` cast of the fn item `inc`. Nothing calls
+    /// `inc` by name, so the call walk never sees it, but the address the cast produces names its
+    /// symbol, so a definition has to exist or the module fails verification with
+    /// "Symbol ... not found". This is the only way a function is collected without being called.
+    fn process_statement(
+        &mut self,
+        statement: &rustc_middle::mir::Statement<'tcx>,
+        caller: &CollectedFunction<'tcx>,
+        ctx: &DiscoveryCtx,
+    ) {
+        use rustc_middle::mir::{CastKind, Operand, Rvalue, StatementKind};
+        use rustc_middle::ty::adjustment::PointerCoercion;
+
+        let StatementKind::Assign(assign) = &statement.kind else {
+            return;
+        };
+        let (_, rvalue) = &**assign;
+        let Rvalue::Cast(
+            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer(_), _),
+            operand,
+            _,
+        ) = rvalue
+        else {
+            return;
+        };
+        let Operand::Constant(constant) = operand else {
+            // A cast of a value that is already a function pointer reifies nothing new.
+            return;
+        };
+        let TyKind::FnDef(def_id, args) = constant.const_.ty().kind() else {
+            return;
+        };
+
+        let typing_env = TypingEnv::fully_monomorphized();
+        let Some(resolved) = Instance::try_resolve(self.tcx, typing_env, *def_id, args)
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let mangled = self.tcx.symbol_name(resolved).name.to_string();
+        if self.seen.contains(&mangled) {
+            return;
+        }
+        if !is_fully_monomorphized(self.tcx, resolved) {
+            return;
+        }
+
+        // The same naming the call path uses, so the address and a direct call agree on the symbol.
+        let name = self.fqdn(resolved);
+        let export_name = self.compute_export_name(&name, resolved);
+        if self.verbose {
+            eprintln!("[collector] Discovered reified function: {name} -> {export_name}");
+        }
+        let _ = caller;
+        self.discovery.insert(mangled.clone(), ctx.clone());
+        self.seen.insert(mangled);
+        self.worklist.push_back(CollectedFunction {
+            instance: resolved,
+            is_kernel: false,
+            export_name,
+        });
     }
 
     /// Process a terminator to find function calls.

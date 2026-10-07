@@ -321,6 +321,7 @@ pub fn translate_rvalue(
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
     loc: Location,
+    legaliser: &mut pliron::identifier::Legaliser,
 ) -> TranslationResult<(Option<Ptr<Operation>>, Value, Option<Ptr<Operation>>)> {
     match rvalue {
         mir::Rvalue::BinaryOp(bin_op, left, right) => {
@@ -600,7 +601,9 @@ pub fn translate_rvalue(
             // the call site. Handled before translate_operand because the
             // zero-sized fn-item operand itself never becomes a value.
             if let mir::CastKind::PointerCoercion(mir::PointerCoercion::ReifyFnPointer(_)) = kind {
-                return translate_reify_fn_pointer(ctx, body, operand, ty, block_ptr, prev_op, loc);
+                return translate_reify_fn_pointer(
+                    ctx, body, operand, ty, block_ptr, prev_op, loc, legaliser,
+                );
             }
 
             let (operand_val, prev_op_after_operand) = translate_operand(
@@ -8334,6 +8337,7 @@ fn translate_reify_fn_pointer(
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
     loc: Location,
+    legaliser: &mut pliron::identifier::Legaliser,
 ) -> TranslationResult<(Option<Ptr<Operation>>, Value, Option<Ptr<Operation>>)> {
     use dialect_mir::ops::MirConstantOp;
     use rustc_public::mir::mono::Instance;
@@ -8373,54 +8377,33 @@ fn translate_reify_fn_pointer(
             ))
         );
     }
-    let mangled = Instance::resolve(fn_def, &substs)
-        .map_err(|e| {
-            input_error_noloc!(TranslationErr::unsupported(format!(
-                "ReifyFnPointer: cannot resolve fn item: {e:?}"
-            )))
-        })?
-        .mangled_name();
-    let token = {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        mangled.hash(&mut h);
-        h.finish() | 1
-    };
-
-    // Materialize the token and cast it to the fn-pointer type, the same
-    // two-op shape used for provenance-carrying pointer constants.
-    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
-    let apint = APInt::from_u64(token, NonZeroUsize::new(64).unwrap());
-    let int_attr = pliron::builtin::attributes::IntegerAttr::new(i64_ty, apint);
-    let int_op = Operation::new(
-        ctx,
-        MirConstantOp::get_concrete_op_info(),
-        vec![i64_ty.into()],
-        vec![],
-        vec![],
-        0,
-    );
-    int_op.deref_mut(ctx).set_loc(loc.clone());
-    MirConstantOp::new(int_op).set_attr_value(ctx, int_attr);
-    match prev_op {
-        Some(prev) => int_op.insert_after(ctx, prev),
-        None => int_op.insert_at_front(block_ptr, ctx),
-    }
-    let int_val = int_op.deref(ctx).get_result(0);
+    let instance = Instance::resolve(fn_def, &substs).map_err(|e| {
+        input_error_noloc!(TranslationErr::unsupported(format!(
+            "ReifyFnPointer: cannot resolve fn item: {e:?}"
+        )))
+    })?;
+    // The symbol the function is defined under, which is the symbol a direct call to it names, so a
+    // call through this address reaches the same definition. The collector collected the function:
+    // taking its address is enough to need its body, even though nothing calls it by name.
+    let symbol = legaliser.legalise(&super::terminator::instance_symbol(&instance));
 
     let result_type = types::translate_type(ctx, dest_ty)?;
-    let cast_op = Operation::new(
+    let addr_op = Operation::new(
         ctx,
-        MirCastOp::get_concrete_op_info(),
+        dialect_mir::ops::MirFuncAddrOp::get_concrete_op_info(),
         vec![result_type],
-        vec![int_val],
+        vec![],
         vec![],
         0,
     );
-    cast_op.deref_mut(ctx).set_loc(loc);
-    MirCastOp::new(cast_op).set_attr_cast_kind(ctx, MirCastKindAttr::PointerWithExposedProvenance);
+    addr_op.deref_mut(ctx).set_loc(loc);
+    dialect_mir::ops::MirFuncAddrOp::new(addr_op)
+        .set_attr_symbol(ctx, pliron::builtin::attributes::StringAttr::new(symbol.to_string()));
 
-    let result = cast_op.deref(ctx).get_result(0);
-    Ok((Some(cast_op), result, Some(int_op)))
+    // The op is returned unlinked, which is this function's contract: the caller inserts the first
+    // element of the tuple after the third. Linking it here would link it twice.
+    let result = addr_op.deref(ctx).get_result(0);
+    Ok((Some(addr_op), result, None))
 }
 
 // Byte-offset lookups over rustc enum layout live in the shared

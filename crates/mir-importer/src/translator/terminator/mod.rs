@@ -970,6 +970,47 @@ fn translate_call(
     // Convert target to Option<usize>
     let target_usize = target.map(|t| t);
 
+    // A callee that is a *constant* function pointer: rustc const-folds a struct of fn items, so the
+    // callee is neither a value nor a fn item. The constant names its function, so the call is
+    // direct and the address never has to exist.
+    if let Some(symbol) = constant_fn_pointer_symbol(func) {
+        let legal_name = legaliser.legalise(&symbol);
+        let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
+        return helpers::emit_function_call(
+            ctx,
+            body,
+            &legal_name,
+            args,
+            destination,
+            return_type,
+            &target_usize,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        );
+    }
+
+    // A callee that is a value rather than a function item: `let f: fn(u32) -> u32 = inc; f(1)`.
+    // The operand's type is a bare function pointer, so there is no signature to read and the
+    // arguments are the signature.
+    if matches!(func, mir::Operand::Copy(_) | mir::Operand::Move(_)) {
+        return emit_indirect_call(
+            ctx,
+            body,
+            func,
+            args,
+            destination,
+            &target_usize,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        );
+    }
+
     // Extract function info
     let (pattern_name, call_name, substs_str) = extract_func_info(func, &loc)?;
 
@@ -1396,7 +1437,30 @@ fn translate_call(
         }
     }
     // Not an intrinsic - emit regular function call
-    let raw_name = call_name.unwrap_or_else(|| "unknown_function".to_string());
+    //
+    // A callee with no name at all is refused here rather than emitted as a call to a symbol nobody
+    // defines: that only surfaces later as an unrelated "Symbol not found" on the LLVM module.
+    let Some(raw_name) = call_name else {
+        let detail = match func {
+            mir::Operand::Constant(constant) => {
+                let kind = match constant.const_.kind() {
+                    ConstantKind::Ty(_) => "Ty",
+                    ConstantKind::Allocated(_) => "Allocated",
+                    ConstantKind::Unevaluated(_) => "Unevaluated",
+                    ConstantKind::Param(_) => "Param",
+                    ConstantKind::ZeroSized => "ZeroSized",
+                };
+                format!("a constant of kind {kind} and type {:?}", constant.const_.ty())
+            }
+            other => format!("{other:?}"),
+        };
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "a call whose callee is neither a function item nor a value: {detail}"
+            ))
+        );
+    };
     let legal_name = legaliser.legalise(&raw_name);
 
     // Type the call result from the caller's destination place, not from the
@@ -2176,6 +2240,53 @@ fn is_cuda_device_const_marker(func: &mir::Operand, expected_name: &str) -> bool
 /// FQDN and the device linker (libdevice, external LTOIR) only knows the
 /// link symbol. `call_name` for those is `Instance::mangled_name`, which is
 /// the link symbol (it honours `#[link_name]`).
+/// The symbol of the function a constant function pointer names, if that is what the operand is.
+///
+/// `let ops = Ops { unary: inc };` is a constant, and `(ops.unary)(1)` const-folds to a call whose
+/// callee is that constant. Its provenance is `GlobalAlloc::Function`, which names the callee, so
+/// the call can be emitted directly and no function address has to exist for it.
+fn constant_fn_pointer_symbol(func: &mir::Operand) -> Option<String> {
+    use rustc_public::mir::alloc::GlobalAlloc;
+    use rustc_public::ty::{ConstantKind, RigidTy, TyConstKind, TyKind};
+
+    let mir::Operand::Constant(constant) = func else {
+        return None;
+    };
+    if !matches!(
+        constant.const_.ty().kind(),
+        TyKind::RigidTy(RigidTy::FnPtr(_))
+    ) {
+        return None;
+    }
+    let allocation = match constant.const_.kind() {
+        ConstantKind::Allocated(allocation) => allocation,
+        ConstantKind::Ty(ty_const) => match ty_const.kind() {
+            TyConstKind::Value(_, allocation) => allocation,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let (_, provenance) = allocation.provenance.ptrs.first()?;
+    match GlobalAlloc::from(provenance.0) {
+        GlobalAlloc::Function(instance) => Some(instance_symbol(&instance)),
+        _ => None,
+    }
+}
+
+/// The symbol an instance is called or referenced under.
+///
+/// A foreign item (`extern "C"`) has no MIR body, so nothing is ever exported under its definition
+/// path: it is called under its link symbol (for example `__nv_asinf`). An instance with generic
+/// arguments is called under its mangled symbol, because its definition path is not unique. This is
+/// the one place the rule lives, so a direct call and the address of the same function agree.
+pub(crate) fn instance_symbol(instance: &rustc_public::mir::mono::Instance) -> String {
+    if instance.is_foreign_item() || !instance.args().0.is_empty() {
+        instance.mangled_name()
+    } else {
+        instance.name().to_string()
+    }
+}
+
 fn extract_func_info(
     func: &mir::Operand,
     loc: &Location,
@@ -2197,18 +2308,7 @@ fn extract_func_info(
 
                         let resolved = Instance::resolve(*fn_def, substs).ok();
                         let call_name = if let Some(instance) = resolved {
-                            if instance.is_foreign_item() {
-                                // Foreign items (`extern "C"` blocks) have no MIR
-                                // body, so no definition is ever exported under
-                                // the FQDN. Emit the call under the link symbol
-                                // (e.g. `__nv_asinf`), which is what libdevice or
-                                // externally linked LTOIR actually provides.
-                                instance.mangled_name()
-                            } else if !instance.args().0.is_empty() {
-                                instance.mangled_name()
-                            } else {
-                                instance.name().to_string()
-                            }
+                            instance_symbol(&instance)
                         } else {
                             pattern_name.clone()
                         };
@@ -2231,6 +2331,61 @@ fn extract_func_info(
 /// `Box`'s drop and `Layout::for_value` reach these with a concrete `T`, so the answer is rustc's
 /// layout and the pointer argument is not read. An unsized `T` (a slice, `str` or `dyn`) needs the
 /// fat pointer's metadata, which this does not lower, so it is refused by name.
+/// Emit `mir.call_indirect`: a call through a function pointer that is a value.
+///
+/// Operand 0 is the callee and the arguments follow, which is the order `mir-lower` splits back
+/// apart; the callee is deliberately not part of `args` so the two cannot drift.
+#[allow(clippy::too_many_arguments)]
+fn emit_indirect_call(
+    ctx: &mut Context,
+    body: &mir::Body,
+    func: &mir::Operand,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    let Some(target_idx) = target else {
+        // A diverging call: `-> !` produces no value and control does not continue.
+        return Ok(emit_trap_unreachable_after(ctx, block_ptr, prev_op, loc));
+    };
+
+    let (callee_val, mut last) =
+        rvalue::translate_operand(ctx, body, func, value_map, block_ptr, prev_op, loc.clone())?;
+    let mut operands = vec![callee_val];
+    for arg in args {
+        let (arg_val, arg_last) =
+            rvalue::translate_operand(ctx, body, arg, value_map, block_ptr, last, loc.clone())?;
+        operands.push(arg_val);
+        last = arg_last;
+    }
+
+    let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
+    let call_op = Operation::new(
+        ctx,
+        dialect_mir::ops::MirCallIndirectOp::get_concrete_op_info(),
+        vec![return_type],
+        operands,
+        vec![],
+        0,
+    );
+    call_op.deref_mut(ctx).set_loc(loc.clone());
+    match last {
+        Some(prev) => call_op.insert_after(ctx, prev),
+        None => call_op.insert_at_front(block_ptr, ctx),
+    }
+
+    let result_value = call_op.deref(ctx).get_result(0);
+    let goto_prev = value_map
+        .store_local(ctx, destination.local, result_value, block_ptr, Some(call_op))
+        .unwrap_or(call_op);
+    Ok(helpers::emit_goto(ctx, *target_idx, goto_prev, block_map, loc))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_layout_of_val(
     ctx: &mut Context,

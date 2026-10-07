@@ -66,7 +66,7 @@ use crate::convert::types::{
     is_zero_sized_type,
 };
 use crate::helpers;
-use dialect_mir::ops::{MirCallOp, MirFuncOp};
+use dialect_mir::ops::{MirCallIndirectOp, MirCallOp, MirFuncAddrOp, MirFuncOp};
 use dialect_mir::rust_intrinsics;
 use dialect_mir::types::{MirDisjointSliceType, MirSliceType, MirStructType, MirTupleType};
 use llvm_export::attributes::{
@@ -638,29 +638,7 @@ pub fn convert(
         None
     };
 
-    let mut zst_replacement_type = None;
-    let result_type = if let Some(mir_ty) = mir_result_ty_ptr {
-        // Only the empty tuple `()` is the unit type. `is::<MirTupleType>()`
-        // also matches `(T, U, ...)`, so we have to peek at the field count.
-        // Non-empty tuples take the convert_type path and end up as an LLVM
-        // struct return, same as named structs.
-        let is_unit = mir_ty
-            .deref(ctx)
-            .downcast_ref::<MirTupleType>()
-            .is_some_and(|t| t.get_types().is_empty());
-        let converted = convert_type(ctx, mir_ty).map_err(anyhow_to_pliron)?;
-        if is_unit || is_zero_sized_type(ctx, converted) {
-            // NVPTX cannot carry a ZST in a function signature, so the call
-            // itself returns void. Keep the converted ZST type so any MIR uses
-            // of the result can be replaced with a typed undef below.
-            zst_replacement_type = Some(converted);
-            llvm_types::VoidType::get(ctx).into()
-        } else {
-            converted
-        }
-    } else {
-        llvm_types::VoidType::get(ctx).into()
-    };
+    let (result_type, zst_replacement_type) = call_result_type(ctx, op)?;
 
     // Look up the callee's declared signature in the parent module. The
     // declaration may already have been lowered to `llvm::FuncOp` (typical
@@ -744,6 +722,115 @@ pub fn convert(
                  (for example, a non-unit tuple treated as `()`)"
             );
         }
+        rewriter.erase_operation(ctx, op);
+    }
+
+    Ok(())
+}
+
+/// The LLVM result type of a MIR call, and the converted zero-sized type when there is one.
+///
+/// NVPTX cannot carry a zero-sized type in a function signature, so a call whose result is one
+/// returns void, and the converted type comes back so a live use of the result can be replaced with
+/// an undef of it.
+fn call_result_type(
+    ctx: &mut Context,
+    op: Ptr<Operation>,
+) -> Result<(pliron::r#type::TypeHandle, Option<pliron::r#type::TypeHandle>)> {
+    if op.deref(ctx).get_num_results() == 0 {
+        return Ok((llvm_types::VoidType::get(ctx).into(), None));
+    }
+    let mir_ty = op.deref(ctx).get_result(0).get_type(ctx);
+    // Only the empty tuple `()` is the unit type. `is::<MirTupleType>()` also matches `(T, U, ...)`,
+    // so we have to peek at the field count. Non-empty tuples take the convert_type path and end up
+    // as an LLVM struct return, same as named structs.
+    let is_unit = mir_ty
+        .deref(ctx)
+        .downcast_ref::<MirTupleType>()
+        .is_some_and(|t| t.get_types().is_empty());
+    let converted = convert_type(ctx, mir_ty).map_err(anyhow_to_pliron)?;
+    if is_unit || is_zero_sized_type(ctx, converted) {
+        Ok((llvm_types::VoidType::get(ctx).into(), Some(converted)))
+    } else {
+        Ok((converted, None))
+    }
+}
+
+/// Lower `mir.func_addr` to the address of the function it names.
+///
+/// The address space is 0: NVPTX function pointers live in the program address space, which is what
+/// the indirect call below expects and what `llvm-export` checks.
+pub fn convert_func_addr(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    _operands_info: &OperandsInfo,
+) -> Result<()> {
+    let symbol: String = match MirFuncAddrOp::new(op).get_attr_symbol(ctx) {
+        Some(symbol) => (*symbol).clone().into(),
+        None => {
+            return pliron::input_err!(
+                op.deref(ctx).loc(),
+                "MirFuncAddrOp missing symbol attribute"
+            );
+        }
+    };
+    let identifier: pliron::identifier::Identifier = resolve_device_extern_symbol(&symbol)
+        .try_into()
+        .expect("function symbol should have been legalized during MIR import");
+
+    let address_of = llvm::AddressOfOp::new(ctx, identifier, 0);
+    rewriter.insert_operation(ctx, address_of.get_operation());
+    rewriter.replace_operation(ctx, op, address_of.get_operation());
+    Ok(())
+}
+
+/// Lower `mir.call_indirect` to an LLVM call through the pointer.
+///
+/// There is no declaration to read a signature from, so the arguments' own types are the signature,
+/// which is why `flatten_arguments` is called with no expected parameters.
+pub fn convert_call_indirect(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    operands_info: &OperandsInfo,
+) -> Result<()> {
+    let operands: Vec<Value> = op.deref(ctx).operands().collect();
+    let Some((callee, args)) = operands.split_first() else {
+        return pliron::input_err!(
+            op.deref(ctx).loc(),
+            "MirCallIndirectOp must have a callee operand"
+        );
+    };
+
+    let (result_type, zst_replacement_type) = call_result_type(ctx, op)?;
+    let (flattened_args, flattened_arg_types) =
+        flatten_arguments(ctx, rewriter, args, operands_info, None)?;
+    let func_type = llvm_types::FuncType::get(ctx, result_type, flattened_arg_types, false);
+
+    let llvm_call = llvm::CallOp::new(
+        ctx,
+        CallOpCallable::Indirect(*callee),
+        func_type,
+        flattened_args,
+    );
+    rewriter.insert_operation(ctx, llvm_call.get_operation());
+
+    let is_void = result_type.deref(ctx).is::<llvm_types::VoidType>();
+    if !is_void && llvm_call.get_operation().deref(ctx).get_num_results() > 0 {
+        rewriter.replace_operation(ctx, op, llvm_call.get_operation());
+    } else if op.deref(ctx).has_use()
+        && let Some(zst_type) = zst_replacement_type
+    {
+        let undef = llvm::UndefOp::new(ctx, zst_type);
+        rewriter.insert_operation(ctx, undef.get_operation());
+        rewriter.replace_operation(ctx, op, undef.get_operation());
+    } else if op.deref(ctx).has_use() {
+        return pliron::input_err!(
+            op.deref(ctx).loc(),
+            "mir.call_indirect lowering produced a void call but the MIR op still has live uses"
+        );
+    } else {
         rewriter.erase_operation(ctx, op);
     }
 

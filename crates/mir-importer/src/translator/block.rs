@@ -84,8 +84,9 @@ pub fn translate_block(
     }
 
     for stmt in &mir_block.statements {
-        let op_ptr =
-            statement::translate_statement(ctx, body, stmt, value_map, block_ptr, prev_op)?;
+        let op_ptr = statement::translate_statement(
+            ctx, body, stmt, value_map, block_ptr, prev_op, legaliser,
+        )?;
         prev_op = op_ptr;
     }
 

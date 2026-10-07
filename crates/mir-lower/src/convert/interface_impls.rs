@@ -26,7 +26,8 @@ use crate::conversion_interface::MirToLlvmConversion;
 
 use dialect_mir::ops::{
     MirAddOp, MirAllocaOp, MirArrayElementAddrOp, MirAssertOp, MirBitAndOp, MirBitOrOp,
-    MirBitXorOp, MirCallOp, MirCastOp, MirCheckedAddOp, MirCheckedMulOp, MirCheckedSubOp, MirCmpOp,
+    MirBitXorOp, MirCallIndirectOp, MirCallOp, MirCastOp, MirCheckedAddOp, MirCheckedMulOp,
+    MirCheckedSubOp, MirCmpOp, MirFuncAddrOp,
     MirCondBranchOp, MirConstantOp, MirConstructArrayOp, MirConstructDisjointSliceOp,
     MirConstructEnumOp, MirConstructSliceOp, MirConstructStructOp, MirConstructTupleOp,
     MirDbgValueOp, MirDivOp, MirEnumPayloadOp, MirEqOp, MirExtractArrayElementOp,
@@ -880,6 +881,30 @@ impl MirToLlvmConversion for MirCallOp {
         operands_info: &OperandsInfo,
     ) -> Result<()> {
         super::ops::call::convert(ctx, rewriter, self.get_operation(), operands_info)
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for MirFuncAddrOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::ops::call::convert_func_addr(ctx, rewriter, self.get_operation(), operands_info)
+    }
+}
+
+#[op_interface_impl]
+impl MirToLlvmConversion for MirCallIndirectOp {
+    fn convert(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        super::ops::call::convert_call_indirect(ctx, rewriter, self.get_operation(), operands_info)
     }
 }
 

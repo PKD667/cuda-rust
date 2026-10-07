@@ -2236,6 +2236,7 @@ fn emit_layout_of_val(
     ctx: &mut Context,
     body: &mir::Body,
     func: &mir::Operand,
+    args: &[mir::Operand],
     align: bool,
     destination: &mir::Place,
     target: &Option<usize>,
@@ -2267,41 +2268,179 @@ fn emit_layout_of_val(
             TranslationErr::unsupported("size_of_val / align_of_val without a type argument".to_string())
         );
     };
-    let size = match pointee.layout().map(|layout| layout.shape()) {
-        Ok(shape) if shape.is_sized() && align => shape.abi_align as u64,
-        Ok(shape) if shape.is_sized() => shape.size.bytes() as u64,
-        _ => {
+    let usize_ty = types::get_usize_type(ctx);
+
+    // A slice, or `str`, which is a byte slice, is the one unsized pointee whose layout is
+    // derivable on the device. `align_of_val` is the element's alignment, still a constant.
+    // `size_of_val` is the element count times the element's size, and the count lives only in the
+    // value: it is field 1 of the `{ ptr, len }` pair the slice lowers to. `sort_unstable` reaches
+    // this through `sift_down`, which is why the device could not sort.
+    let slice_element = match pointee.kind() {
+        TyKind::RigidTy(RigidTy::Slice(element)) => Some(Some(element)),
+        TyKind::RigidTy(RigidTy::Str) => Some(None),
+        _ => None,
+    };
+
+    // A `Some` is an answer that is a constant. The other path has already emitted its ops and
+    // leaves `computed` naming the value they produce.
+    let mut constant: Option<u64> = None;
+    let mut computed: Option<(pliron::value::Value, Ptr<Operation>)> = None;
+
+    if let Some(element) = slice_element {
+        let (element_size, element_align) = match element {
+            Some(element) => {
+                let layout = match element.layout() {
+                    Ok(layout) => layout,
+                    Err(error) => {
+                        return input_err!(
+                            loc,
+                            TranslationErr::unsupported(format!(
+                                "size_of_val / align_of_val: cannot lay out the slice element: {error:?}"
+                            ))
+                        );
+                    }
+                };
+                let shape = layout.shape();
+                if !shape.is_sized() {
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported(format!(
+                            "size_of_val / align_of_val of a slice of the unsized type {element:?} \
+                             is not lowered on the device"
+                        ))
+                    );
+                }
+                (shape.size.bytes() as u64, shape.abi_align as u64)
+            }
+            None => (1, 1),
+        };
+        if align {
+            constant = Some(element_align);
+        } else {
+            let slice = match args.first() {
+                Some(argument) => argument,
+                None => {
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported(
+                            "size_of_val of a slice without an argument".to_string()
+                        )
+                    );
+                }
+            };
+            let (slice_val, mut last) = rvalue::translate_operand(
+                ctx,
+                body,
+                slice,
+                value_map,
+                block_ptr,
+                prev_op,
+                loc.clone(),
+            )?;
+            let extract_len_op = Operation::new(
+                ctx,
+                dialect_mir::ops::MirExtractFieldOp::get_concrete_op_info(),
+                vec![usize_ty.into()],
+                vec![slice_val],
+                vec![],
+                0,
+            );
+            extract_len_op.deref_mut(ctx).set_loc(loc.clone());
+            let extract_len = dialect_mir::ops::MirExtractFieldOp::new(extract_len_op);
+            extract_len.set_attr_index(ctx, dialect_mir::attributes::FieldIndexAttr(1));
+            match last {
+                Some(prev) => extract_len.get_operation().insert_after(ctx, prev),
+                None => extract_len.get_operation().insert_at_front(block_ptr, ctx),
+            }
+            last = Some(extract_len.get_operation());
+            let len_val = extract_len.get_operation().deref(ctx).get_result(0);
+
+            // `str` and `u8` slices are already counted in bytes.
+            if element_size == 1 {
+                computed = Some((len_val, extract_len.get_operation()));
+            } else {
+                let bytes_op = Operation::new(
+                    ctx,
+                    dialect_mir::ops::MirConstantOp::get_concrete_op_info(),
+                    vec![usize_ty.into()],
+                    vec![],
+                    vec![],
+                    0,
+                );
+                bytes_op.deref_mut(ctx).set_loc(loc.clone());
+                MirConstantOp::new(bytes_op).set_attr_value(
+                    ctx,
+                    IntegerAttr::new(
+                        usize_ty,
+                        APInt::from_u64(element_size, NonZeroUsize::new(64).unwrap()),
+                    ),
+                );
+                bytes_op.insert_after(ctx, extract_len.get_operation());
+                let bytes_val = bytes_op.deref(ctx).get_result(0);
+
+                let mul_op = Operation::new(
+                    ctx,
+                    dialect_mir::ops::MirMulOp::get_concrete_op_info(),
+                    vec![usize_ty.into()],
+                    vec![len_val, bytes_val],
+                    vec![],
+                    0,
+                );
+                mul_op.deref_mut(ctx).set_loc(loc.clone());
+                mul_op.insert_after(ctx, bytes_op);
+                computed = Some((mul_op.deref(ctx).get_result(0), mul_op));
+            }
+        }
+    } else {
+        match pointee.layout().map(|layout| layout.shape()) {
+            Ok(shape) if shape.is_sized() && align => constant = Some(shape.abi_align as u64),
+            Ok(shape) if shape.is_sized() => constant = Some(shape.size.bytes() as u64),
+            _ => {
+                return input_err!(
+                    loc,
+                    TranslationErr::unsupported(format!(
+                        "size_of_val / align_of_val of the unsized type {pointee:?} is not lowered on the device"
+                    ))
+                );
+            }
+        }
+    }
+
+    let (size_val, last_op) = match (constant, computed) {
+        (Some(size), _) => {
+            let size_op = Operation::new(
+                ctx,
+                MirConstantOp::get_concrete_op_info(),
+                vec![usize_ty.into()],
+                vec![],
+                vec![],
+                0,
+            );
+            size_op.deref_mut(ctx).set_loc(loc.clone());
+            MirConstantOp::new(size_op).set_attr_value(
+                ctx,
+                IntegerAttr::new(usize_ty, APInt::from_u64(size, NonZeroUsize::new(64).unwrap())),
+            );
+            match prev_op {
+                Some(prev) => size_op.insert_after(ctx, prev),
+                None => size_op.insert_at_front(block_ptr, ctx),
+            }
+            (size_op.deref(ctx).get_result(0), size_op)
+        }
+        (None, Some(computed)) => computed,
+        (None, None) => {
             return input_err!(
                 loc,
-                TranslationErr::unsupported(format!(
-                    "size_of_val / align_of_val of the unsized type {pointee:?} is not lowered on the device"
-                ))
+                TranslationErr::unsupported(
+                    "size_of_val / align_of_val produced no value".to_string()
+                )
             );
         }
     };
 
-    let usize_ty = IntegerType::get(ctx, 64, Signedness::Unsigned);
-    let size_op = Operation::new(
-        ctx,
-        MirConstantOp::get_concrete_op_info(),
-        vec![usize_ty.into()],
-        vec![],
-        vec![],
-        0,
-    );
-    size_op.deref_mut(ctx).set_loc(loc.clone());
-    MirConstantOp::new(size_op).set_attr_value(
-        ctx,
-        IntegerAttr::new(usize_ty, APInt::from_u64(size, NonZeroUsize::new(64).unwrap())),
-    );
-    match prev_op {
-        Some(prev) => size_op.insert_after(ctx, prev),
-        None => size_op.insert_at_front(block_ptr, ctx),
-    }
-    let size_val = size_op.deref(ctx).get_result(0);
     let goto_prev = value_map
-        .store_local(ctx, destination.local, size_val, block_ptr, Some(size_op))
-        .unwrap_or(size_op);
+        .store_local(ctx, destination.local, size_val, block_ptr, Some(last_op))
+        .unwrap_or(last_op);
 
     if let Some(target_idx) = target {
         Ok(helpers::emit_goto(ctx, *target_idx, goto_prev, block_map, loc))
@@ -2864,6 +3003,7 @@ fn try_dispatch_intrinsic(
                 ctx,
                 body,
                 func,
+                args,
                 name.ends_with("align_of_val"),
                 destination,
                 target,

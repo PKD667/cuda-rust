@@ -54,9 +54,13 @@ non-zero and Rust reads the sign, so an intrinsic is not a lowering for it. `cor
 `target_arch` and core is precompiled for x86_64, so the device build reaches
 `core::arch::x86_64::_mm_pause`, whose declaration names `llvm.x86.sse2.pause`. There is no pause
 instruction on the device, and the standard library's own rule for a platform that does not support
-the hint is to do nothing. Still refused:
-`size_of_val` of an unsized type, and anything reaching `core::fmt` or a `dyn` vtable — which
-includes `Result::unwrap` and `Result::expect`, whose panic path takes `&dyn Debug`.
+the hint is to do nothing. `size_of_val` and `align_of_val` of a slice lower too:
+`align_of_val` is the element alignment, still a constant, and `size_of_val` is the element count
+times the element size, the count being field 1 of the `{ ptr, len }` pair the slice lowers to.
+`sort_unstable` reaches this through `sift_down`. Still refused:
+`size_of_val` of any other unsized type, anything reaching `core::fmt` or a `dyn` vtable — which
+includes `Result::unwrap` and `Result::expect`, whose panic path takes `&dyn Debug` — and a constant
+whose bytes carry a relocation, which is what a slice compared with a literal is.
 
 The remaining enum storage fixtures deliberately fail closed. A pointer word
 and a *whole* pointer-sized integer word may share bytes: the shared bytes are

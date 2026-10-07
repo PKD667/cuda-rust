@@ -50,7 +50,19 @@ materialized as a slice of a promoted immutable global whose bytes come from the
 provenance names, with the length read from the fat pointer. A slice constant whose element is wider
 than a byte is refused by name. `compare_bytes` is served by a loop in `cuda_device::mem`, which
 the collector enqueues where device code calls the intrinsic: `llvm.memcmp` only promises zero or
-non-zero and Rust reads the sign, so an intrinsic is not a lowering for it. `core::hint::spin_loop` lowers to nothing: core selects its body with `cfg_select!` on
+non-zero and Rust reads the sign, so an intrinsic is not a lowering for it. A function's address is real. `let f: fn(u32) -> u32 = inc;` used to hash the function's mangled
+name into an integer and cast that to a pointer: the value compared and stored, but it was not an
+address, and calling through it was refused because no definition existed under any name the call
+could reach. `mir.func_addr` now names the function, under the symbol a direct call to it names, so
+the two reach the same definition; `mir.call_indirect` calls through a value, with the callee as
+operand 0 and the arguments after it, since a function pointer carries no signature. The collector
+collects a function whose address is taken, which it did not before, because nothing called it by
+name. A call whose callee is a *constant* function pointer is emitted directly: rustc const-folds a
+struct of fn items, and the constant's provenance is `GlobalAlloc::Function`, which names the
+function it points at. `llvm-export` already implemented `CallOpCallable::Indirect` and
+`AddressOfOp`, so nothing below the MIR dialect changed.
+
+`core::hint::spin_loop` lowers to nothing: core selects its body with `cfg_select!` on
 `target_arch` and core is precompiled for x86_64, so the device build reaches
 `core::arch::x86_64::_mm_pause`, whose declaration names `llvm.x86.sse2.pause`. There is no pause
 instruction on the device, and the standard library's own rule for a platform that does not support

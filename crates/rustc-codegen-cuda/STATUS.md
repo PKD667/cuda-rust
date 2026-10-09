@@ -62,6 +62,19 @@ struct of fn items, and the constant's provenance is `GlobalAlloc::Function`, wh
 function it points at. `llvm-export` already implemented `CallOpCallable::Indirect` and
 `AddressOfOp`, so nothing below the MIR dialect changed.
 
+`cuda_device::warp::{run_worker, dispatch}` provides a cooperative-entry prerequisite: one
+controller keeps 31 helper lanes resident instead of letting them exit before future work exists.
+The controller publishes a callback and frame through block-shared storage, helpers release their
+completion after calling it, and the controller acquires every helper before reusing the frame.
+Only entry and exit use a converged full-warp barrier; the divergent service loop uses block-scope
+acquire/release. All callback frames must already be warp-accessible: this is not promotion of a
+private local pointer, a generic result-transfer implementation, an allocator service, or a nested
+invocation scheduler. The two unsafe primitives make those missing obligations explicit rather
+than supplying a CPU model or a scalar fallback. An isolated sm_75 probe passed on rome4gpu GPU1
+(RTX 2080 SUPER, driver 550.163.01): two independent warps, two complete worker lifetimes,
+lengths 0/1/30/31/32/96, each item once, all 31 physical helpers, and two callback addresses.
+This is entry/dispatch evidence, not support for trame's full public `parallel` signature.
+
 `core::hint::spin_loop` lowers to nothing: core selects its body with `cfg_select!` on
 `target_arch` and core is precompiled for x86_64, so the device build reaches
 `core::arch::x86_64::_mm_pause`, whose declaration names `llvm.x86.sse2.pause`. There is no pause

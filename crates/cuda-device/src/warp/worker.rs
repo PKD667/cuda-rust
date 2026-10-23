@@ -10,6 +10,7 @@ use crate::atomic::{AtomicOrdering, BlockAtomicU32};
 use crate::shared::SharedArray;
 
 const HELPERS: usize = 31;
+const HELPERS_MASK: u32 = (1 << HELPERS) - 1;
 // CUDA admits at most 1024 threads, hence 32 warps, in one block.
 const WARPS: usize = 32;
 
@@ -24,12 +25,12 @@ struct Team {
     epoch: BlockAtomicU32,
     stopped: BlockAtomicU32,
     job: UnsafeCell<Option<Job>>,
-    completed: [BlockAtomicU32; HELPERS],
+    completed: BlockAtomicU32,
 }
 
 // SAFETY: only the controller writes `job`, before releasing an epoch. It cannot overwrite the
 // job until all helpers release completion, which the controller acquires. Each helper owns one
-// completion word; all state words are atomic while the team is live.
+// completion bit; all state words are atomic while the team is live.
 unsafe impl Sync for Team {}
 
 static mut TEAMS: SharedArray<Team, WARPS> = SharedArray::UNINIT;
@@ -62,7 +63,7 @@ pub unsafe fn run_worker(body: impl FnOnce()) {
                 epoch: BlockAtomicU32::new(0),
                 stopped: BlockAtomicU32::new(0),
                 job: UnsafeCell::new(None),
-                completed: [const { BlockAtomicU32::new(0) }; HELPERS],
+                completed: BlockAtomicU32::new(0),
             });
         }
     }
@@ -91,7 +92,8 @@ unsafe fn serve(team: &Team, slot: u32) {
             if slot < job.count {
                 unsafe { (job.callback)(job.frame, slot) };
             }
-            team.completed[slot as usize].store(epoch, AtomicOrdering::Release);
+            team.completed
+                .fetch_or(1u32 << slot, AtomicOrdering::Release);
             seen = epoch;
         }
     }
@@ -117,13 +119,10 @@ pub unsafe fn dispatch(
     assert!(super::lane_id() == 0 && count <= HELPERS as u32);
     let team = unsafe { team() };
     let epoch = team.epoch.load(AtomicOrdering::Relaxed).wrapping_add(1);
+    team.completed.store(0, AtomicOrdering::Relaxed);
     unsafe { *team.job.get() = Some(Job { callback, frame, count }) };
     team.epoch.store(epoch, AtomicOrdering::Release);
-    let mut pending = 0;
-    while pending < HELPERS {
+    while team.completed.load(AtomicOrdering::Acquire) != HELPERS_MASK {
         service();
-        if team.completed[pending].load(AtomicOrdering::Acquire) == epoch {
-            pending += 1;
-        }
     }
 }
